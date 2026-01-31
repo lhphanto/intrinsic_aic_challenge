@@ -430,6 +430,19 @@ EngineState Engine::initialize() {
     return engine_state_;
   }
 
+  if (!config_["robot"]) {
+    RCLCPP_ERROR(node_->get_logger(), "Config missing required key: 'robot'");
+    engine_state_ = EngineState::Error;
+    return engine_state_;
+  }
+  const auto& robot_config = config_["robot"];
+  if (!robot_config["home_joint_positions"]) {
+    RCLCPP_ERROR(node_->get_logger(),
+                 "Config missing required key: 'robot.home_joint_positions'");
+    engine_state_ = EngineState::Error;
+    return engine_state_;
+  }
+
   // Create ROS endpoints.
   const rclcpp::QoS reliable_qos = rclcpp::QoS(rclcpp::KeepLast(10)).reliable();
 
@@ -450,19 +463,60 @@ EngineState Engine::initialize() {
       },
       sub_options_ignore_local);
 
+  joint_motion_update_pub_ = node_->create_publisher<JointMotionUpdateMsg>(
+      "/aic_controller/joint_commands", reliable_qos);
+
   insert_cable_action_client_ =
       rclcpp_action::create_client<InsertCableAction>(node_, "/insert_cable");
   spawn_entity_client_ =
       node_->create_client<SpawnEntitySrv>("/gz_server/spawn_entity");
   delete_entity_client_ =
       node_->create_client<DeleteEntitySrv>("/gz_server/delete_entity");
+  change_target_mode_client_ = node_->create_client<ChangeTargetModeSrv>(
+      "/aic_controller/change_target_mode");
   model_get_state_client_ = node_->create_client<lifecycle_msgs::srv::GetState>(
       model_get_state_service_name_);
   model_change_state_client_ =
       node_->create_client<lifecycle_msgs::srv::ChangeState>(
           model_change_state_service_name_);
+  reset_joints_client_ =
+      node_->create_client<ResetJointsSrv>("/scoring/reset_joints");
   tf_buffer_ = std::make_unique<tf2_ros::Buffer>(node_->get_clock());
   tf_listener_ = std::make_unique<tf2_ros::TransformListener>(*tf_buffer_);
+
+  // Pre-build home messages directly from config
+  const auto joint_config = robot_config["home_joint_positions"];
+  if (joint_config.size() != 6) {
+    RCLCPP_ERROR(node_->get_logger(),
+                 "Home joint positions should account for exactly 6 joints.");
+    return EngineState::Error;
+  }
+
+  // Build JointMotionUpdateMsg and ResetJointsSrv::Request for homing
+  auto home_point = JointTrajectoryPoint();
+  home_point.positions = {};
+  home_reset_joints_request_ = std::make_shared<ResetJointsSrv::Request>();
+
+  for (auto it = joint_config.begin(); it != joint_config.end(); ++it) {
+    const std::string joint_name = it->first.as<std::string>();
+    const double initial_pos = it->second.as<double>();
+
+    RCLCPP_INFO(node_->get_logger(),
+                "Retrieved home joint position from config: [%s]: %f",
+                joint_name.c_str(), initial_pos);
+
+    home_point.positions.emplace_back(initial_pos);
+    home_reset_joints_request_->joint_names.emplace_back(joint_name);
+    home_reset_joints_request_->initial_positions.emplace_back(initial_pos);
+  }
+
+  home_joint_msg_.target_state = home_point;
+  home_joint_msg_.target_stiffness = {100.0, 100.0, 100.0, 50.0, 50.0, 50.0};
+  home_joint_msg_.target_damping = {40.0, 40.0, 40.0, 15.0, 15.0, 15.0};
+  home_joint_msg_.trajectory_generation_mode.mode =
+      TrajectoryGenerationMode::MODE_POSITION;
+
+  RCLCPP_INFO(node_->get_logger(), "Pre-built home messages for robot homing.");
 
   scoring_tier2_ = std::make_unique<aic_scoring::ScoringTier2>(node_.get());
   if (!scoring_tier2_->Initialize(config_["scoring"])) {
@@ -1274,9 +1328,102 @@ void Engine::reset_after_trial(const Trial& trial) {
       }
     }
   }
+
+  // Home robot after removing entities to prepare for next trial
+  if (!home_robot()) {
+    RCLCPP_ERROR(node_->get_logger(),
+                 "Failed to home robot during trial reset.");
+  }
+
   is_first_trial_ = false;
   model_discovered_ = false;
   RCLCPP_INFO(node_->get_logger(), "Reset after trial completed.");
+}
+
+//==============================================================================
+bool Engine::home_robot() {
+  RCLCPP_INFO(node_->get_logger(), "Homing robot to initial positions...");
+
+  // Switch to joint mode
+  if (!change_target_mode(ChangeTargetModeSrv::Request::TARGET_MODE_JOINT)) {
+    RCLCPP_ERROR(node_->get_logger(),
+                 "Failed to switch to joint mode for homing.");
+    return false;
+  }
+
+  // Publish pre-built joint command to controller
+  joint_motion_update_pub_->publish(home_joint_msg_);
+
+  // Wait for the robot to reach home position if possible without resetting.
+  std::this_thread::sleep_for(std::chrono::seconds(2));
+
+  // Request for joints reset to home positions using pre-built request for
+  // extra safety.
+  auto reset_joints_future =
+      reset_joints_client_->async_send_request(home_reset_joints_request_);
+  if (reset_joints_future.wait_for(std::chrono::seconds(10)) !=
+      std::future_status::ready) {
+    RCLCPP_ERROR(node_->get_logger(),
+                 "ResetJoints service call timed out requesting for reset!");
+    return false;
+  }
+  auto reset_joints_response = reset_joints_future.get();
+  if (!reset_joints_response->success) {
+    RCLCPP_ERROR(node_->get_logger(), "Failed to request for joint reset.");
+    return false;
+  }
+
+  // Switch to cartesian mode after homing
+  if (!change_target_mode(
+          ChangeTargetModeSrv::Request::TARGET_MODE_CARTESIAN)) {
+    RCLCPP_ERROR(node_->get_logger(),
+                 "Failed to switch to cartesian mode after homing.");
+    return false;
+  }
+
+  RCLCPP_INFO(
+      node_->get_logger(),
+      "Successfully reset joints to home position, robot homed successfully.");
+  return true;
+}
+
+//==============================================================================
+bool Engine::change_target_mode(const uint8_t target_mode) {
+  auto change_mode_request = std::make_shared<ChangeTargetModeSrv::Request>();
+  change_mode_request->target_mode = target_mode;
+  std::string target_mode_str;
+  switch (target_mode) {
+    case ChangeTargetModeSrv::Request::TARGET_MODE_JOINT:
+      target_mode_str = "JOINT";
+      break;
+    case ChangeTargetModeSrv::Request::TARGET_MODE_CARTESIAN:
+      target_mode_str = "CARTESIAN";
+      break;
+    default:
+      RCLCPP_ERROR(node_->get_logger(), "Unknown target mode requested.");
+      return false;
+  }
+
+  auto change_mode_future =
+      change_target_mode_client_->async_send_request(change_mode_request);
+  if (change_mode_future.wait_for(std::chrono::seconds(5)) !=
+      std::future_status::ready) {
+    RCLCPP_ERROR(node_->get_logger(),
+                 "ChangeTargetMode service call timed out when changing to "
+                 "%s mode",
+                 target_mode_str.c_str());
+    return false;
+  }
+  auto change_mode_response = change_mode_future.get();
+  if (!change_mode_response->success) {
+    RCLCPP_ERROR(node_->get_logger(), "Failed to change target mode to %s mode",
+                 target_mode_str.c_str());
+    return false;
+  }
+  RCLCPP_INFO(node_->get_logger(),
+              "Successfully changed target mode to %s mode",
+              target_mode_str.c_str());
+  return true;
 }
 
 //==============================================================================
