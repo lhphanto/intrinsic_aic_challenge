@@ -530,6 +530,8 @@ EngineState Engine::initialize() {
     RCLCPP_ERROR(node_->get_logger(), "Failed to initialize scoring system");
     return EngineState::Error;
   }
+  scoring_tier2_->SetGripperFrame(
+      node_->get_parameter("gripper_frame_name").as_string());
 
   // Create output directory for bag files.
   std::error_code ec;
