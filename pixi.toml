@@ -7,6 +7,13 @@ version = "0.1.0"
 conda-pypi-map = { "robostack-kilted" = "robostack_mapping.json" }
 preview = ["pixi-build"]
 
+
+[package.build]
+backend = { name = "pixi-build-ros", version = "*" }
+
+[package.build.config]
+distro = "kilted"
+
 [target.linux-64.dependencies]
 evdev = ">=1.9.2,<2"
 
@@ -42,6 +49,7 @@ lerobot = "==0.5.1"
 lerobot_robot_ros = { git = "https://github.com/koonpeng/lerobot-ros", rev = "87708d0ae14a724bca78f8ae9d55448332509a57", subdirectory = "lerobot_robot_ros" }
 lerobot_teleoperator_devices = { git = "https://github.com/koonpeng/lerobot-ros", rev = "87708d0ae14a724bca78f8ae9d55448332509a57", subdirectory = "lerobot_teleoperator_devices" }
 mujoco = "==3.5.0"
+scipy = ">=1.12.0"
 pynput = ">=1.7.6,<2"
 pyspacemouse = ">=2.0.0, <3"
 
