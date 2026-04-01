@@ -92,6 +92,7 @@ ObservationState = TypedDict(
         "wrench.torque.x": float,
         "wrench.torque.y": float,
         "wrench.torque.z": float,
+        "max_force_magnitude": float,
         "insertion_event": float,
     },
 )
@@ -395,6 +396,7 @@ class AICRobotAICController(Robot):
             "wrench.torque.x": self.last_wrench.wrench.torque.x if self.last_wrench else 0.0,
             "wrench.torque.y": self.last_wrench.wrench.torque.y if self.last_wrench else 0.0,
             "wrench.torque.z": self.last_wrench.wrench.torque.z if self.last_wrench else 0.0,
+            "max_force_magnitude": self.max_force_magnitude,
             "insertion_event": self.last_insertion_event,
         }
 
