@@ -23,6 +23,8 @@ from functools import cached_property
 from threading import Thread
 from typing import Any, Callable, TypedDict, cast
 
+import math
+
 import cv2
 import numpy as np
 import rclpy
@@ -34,7 +36,7 @@ from aic_control_interfaces.msg import (
     TrajectoryGenerationMode,
 )
 from aic_control_interfaces.srv import ChangeTargetMode
-from geometry_msgs.msg import Twist, Vector3, Wrench
+from geometry_msgs.msg import Twist, Vector3, Wrench, WrenchStamped
 from lerobot.cameras import CameraConfig, make_cameras_from_configs
 from lerobot.robots import Robot, RobotConfig
 from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
@@ -47,6 +49,7 @@ from rclpy.publisher import Publisher
 from rclpy.qos import qos_profile_sensor_data
 from rclpy.subscription import Subscription
 from sensor_msgs.msg import JointState
+from std_msgs.msg import String
 
 from .aic_robot import aic_cameras, arm_joint_names
 from .types import JointMotionUpdateActionDict, MotionUpdateActionDict
@@ -83,6 +86,13 @@ ObservationState = TypedDict(
         "joint_positions.4": float,
         "joint_positions.5": float,
         "joint_positions.6": float,
+        "wrench.force.x": float,
+        "wrench.force.y": float,
+        "wrench.force.z": float,
+        "wrench.torque.x": float,
+        "wrench.torque.y": float,
+        "wrench.torque.z": float,
+        "insertion_event": float,
     },
 )
 
@@ -123,12 +133,16 @@ class AICRos2Interface:
     joint_motion_update_pub: Publisher[JointMotionUpdate]
     controller_state_sub: Subscription[ControllerState]
     joint_states_sub: Subscription[JointState]
+    wrench_sub: Subscription[WrenchStamped]
+    insertion_event_sub: Subscription[String]
     logger: RcutilsLogger
 
     @staticmethod
     def connect(
         controller_state_cb: Callable[[ControllerState], None],
         joint_states_cb: Callable[[JointState], None],
+        wrench_cb: Callable[[WrenchStamped], None],
+        insertion_event_cb: Callable[[String], None],
     ) -> "AICRos2Interface":
         if not rclpy.ok():
             rclpy.init()
@@ -163,6 +177,14 @@ class AICRos2Interface:
             JointState, "/joint_states", joint_states_cb, qos_profile_sensor_data
         )
 
+        wrench_sub = node.create_subscription(
+            WrenchStamped, "/fts_broadcaster/wrench", wrench_cb, 10
+        )
+
+        insertion_event_sub = node.create_subscription(
+            String, "/scoring/insertion_event", insertion_event_cb, 10
+        )
+
         executor = SingleThreadedExecutor()
         executor.add_node(node)
         executor_thread = Thread(target=executor.spin, daemon=True)
@@ -178,6 +200,8 @@ class AICRos2Interface:
             joint_motion_update_pub=joint_motion_update_pub,
             controller_state_sub=controller_state_sub,
             joint_states_sub=joint_states_sub,
+            wrench_sub=wrench_sub,
+            insertion_event_sub=insertion_event_sub,
             logger=logger,
         )
 
@@ -192,6 +216,9 @@ class AICRobotAICController(Robot):
         self.ros2_interface: AICRos2Interface | None = None
         self.last_controller_state: ControllerState | None = None
         self.last_joint_states: JointState | None = None
+        self.last_wrench: WrenchStamped | None = None
+        self.max_force_magnitude: float = 0.0
+        self.last_insertion_event: float = 0.0
 
         self._is_connected = False
 
@@ -283,8 +310,23 @@ class AICRobotAICController(Robot):
         def joint_states_cb(msg: JointState):
             self.last_joint_states = msg
 
+        def wrench_cb(msg: WrenchStamped):
+            self.last_wrench = msg
+            magnitude = math.sqrt(
+                msg.wrench.force.x ** 2
+                + msg.wrench.force.y ** 2
+                + msg.wrench.force.z ** 2
+            )
+            if magnitude > self.max_force_magnitude:
+                self.max_force_magnitude = magnitude
+
+        def insertion_event_cb(msg: String):
+            if msg.data:
+                print(f"Insertion event: {msg.data}")
+            self.last_insertion_event = 1.0 if msg.data else 0.0
+
         self.ros2_interface = AICRos2Interface.connect(
-            controller_state_cb, joint_states_cb
+            controller_state_cb, joint_states_cb, wrench_cb, insertion_event_cb
         )
 
         change_mode_req = (
@@ -347,6 +389,13 @@ class AICRobotAICController(Robot):
             "joint_positions.4": joint_positions[4],
             "joint_positions.5": joint_positions[5],
             "joint_positions.6": joint_positions[6],
+            "wrench.force.x": self.last_wrench.wrench.force.x if self.last_wrench else 0.0,
+            "wrench.force.y": self.last_wrench.wrench.force.y if self.last_wrench else 0.0,
+            "wrench.force.z": self.last_wrench.wrench.force.z if self.last_wrench else 0.0,
+            "wrench.torque.x": self.last_wrench.wrench.torque.x if self.last_wrench else 0.0,
+            "wrench.torque.y": self.last_wrench.wrench.torque.y if self.last_wrench else 0.0,
+            "wrench.torque.z": self.last_wrench.wrench.torque.z if self.last_wrench else 0.0,
+            "insertion_event": self.last_insertion_event,
         }
 
         # Capture images from cameras
