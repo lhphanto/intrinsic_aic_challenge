@@ -92,6 +92,12 @@ ObservationState = TypedDict(
         "wrench.torque.x": float,
         "wrench.torque.y": float,
         "wrench.torque.z": float,
+        "fts_tare_offset.force.x": float,
+        "fts_tare_offset.force.y": float,
+        "fts_tare_offset.force.z": float,
+        "fts_tare_offset.torque.x": float,
+        "fts_tare_offset.torque.y": float,
+        "fts_tare_offset.torque.z": float,
         "max_force_magnitude": float,
         "insertion_event": float,
     },
@@ -220,6 +226,7 @@ class AICRobotAICController(Robot):
         self.last_wrench: WrenchStamped | None = None
         self.max_force_magnitude: float = 0.0
         self.last_insertion_event: float = 0.0
+        self.fts_tare_offset: WrenchStamped = WrenchStamped()
 
         self._is_connected = False
 
@@ -307,16 +314,18 @@ class AICRobotAICController(Robot):
 
         def controller_state_cb(msg: ControllerState):
             self.last_controller_state = msg
+            self.fts_tare_offset = msg.fts_tare_offset
 
         def joint_states_cb(msg: JointState):
             self.last_joint_states = msg
 
         def wrench_cb(msg: WrenchStamped):
             self.last_wrench = msg
+            tare = self.fts_tare_offset.wrench
             magnitude = math.sqrt(
-                msg.wrench.force.x ** 2
-                + msg.wrench.force.y ** 2
-                + msg.wrench.force.z ** 2
+                (msg.wrench.force.x - tare.force.x) ** 2
+                + (msg.wrench.force.y - tare.force.y) ** 2
+                + (msg.wrench.force.z - tare.force.z) ** 2
             )
             if magnitude > self.max_force_magnitude:
                 self.max_force_magnitude = magnitude
@@ -390,12 +399,18 @@ class AICRobotAICController(Robot):
             "joint_positions.4": joint_positions[4],
             "joint_positions.5": joint_positions[5],
             "joint_positions.6": joint_positions[6],
-            "wrench.force.x": self.last_wrench.wrench.force.x if self.last_wrench else 0.0,
-            "wrench.force.y": self.last_wrench.wrench.force.y if self.last_wrench else 0.0,
-            "wrench.force.z": self.last_wrench.wrench.force.z if self.last_wrench else 0.0,
-            "wrench.torque.x": self.last_wrench.wrench.torque.x if self.last_wrench else 0.0,
-            "wrench.torque.y": self.last_wrench.wrench.torque.y if self.last_wrench else 0.0,
-            "wrench.torque.z": self.last_wrench.wrench.torque.z if self.last_wrench else 0.0,
+            "wrench.force.x": (self.last_wrench.wrench.force.x - self.fts_tare_offset.wrench.force.x) if self.last_wrench else 0.0,
+            "wrench.force.y": (self.last_wrench.wrench.force.y - self.fts_tare_offset.wrench.force.y) if self.last_wrench else 0.0,
+            "wrench.force.z": (self.last_wrench.wrench.force.z - self.fts_tare_offset.wrench.force.z) if self.last_wrench else 0.0,
+            "wrench.torque.x": (self.last_wrench.wrench.torque.x - self.fts_tare_offset.wrench.torque.x) if self.last_wrench else 0.0,
+            "wrench.torque.y": (self.last_wrench.wrench.torque.y - self.fts_tare_offset.wrench.torque.y) if self.last_wrench else 0.0,
+            "wrench.torque.z": (self.last_wrench.wrench.torque.z - self.fts_tare_offset.wrench.torque.z) if self.last_wrench else 0.0,
+            "fts_tare_offset.force.x": self.fts_tare_offset.wrench.force.x,
+            "fts_tare_offset.force.y": self.fts_tare_offset.wrench.force.y,
+            "fts_tare_offset.force.z": self.fts_tare_offset.wrench.force.z,
+            "fts_tare_offset.torque.x": self.fts_tare_offset.wrench.torque.x,
+            "fts_tare_offset.torque.y": self.fts_tare_offset.wrench.torque.y,
+            "fts_tare_offset.torque.z": self.fts_tare_offset.wrench.torque.z,
             "max_force_magnitude": self.max_force_magnitude,
             "insertion_event": self.last_insertion_event,
         }
