@@ -10,8 +10,16 @@ Prerequisites:
   2. Resetter node running (via reset_env.sh in distrobox)
 
 Usage:
-  pixi run python aic_utils/aic_training/example_training_loop.py
+  pixi run python3 aic_utils/aic_training/example_training_loop.py
 """
+
+import sys
+from pathlib import Path
+
+# Add aic_utils to path so aic_training is importable
+_aic_utils = str(Path(__file__).resolve().parent.parent)
+if _aic_utils not in sys.path:
+    sys.path.insert(0, _aic_utils)
 
 import numpy as np
 from aic_training.aic_gym_env import AICGymEnv, AICGymEnvConfig
@@ -22,7 +30,7 @@ def main():
     config = AICGymEnvConfig(
         control_mode="cartesian",
         control_freq_hz=10.0,
-        max_episode_steps=500,  # 50 seconds at 10 Hz
+        max_episode_steps=600,  # 60 seconds at 10 Hz
     )
 
     env = AICGymEnv(config=config)

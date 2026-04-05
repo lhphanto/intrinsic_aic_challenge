@@ -63,7 +63,7 @@ CABLE_ENTITY_NAME = "cable_0"
 
 # Timeouts
 SERVICE_TIMEOUT_SEC = 10.0
-STABILIZE_TIMEOUT_SEC = 10.0
+STABILIZE_TIMEOUT_SEC = 20.0
 JOINT_VELOCITY_THRESHOLD = 1e-3
 
 
@@ -187,12 +187,20 @@ class EnvResetter(Node):
         return True
 
     def _call_service(self, client, request, name: str):
-        """Synchronous service call with timeout."""
+        """Synchronous service call with timeout.
+
+        Uses a busy-wait instead of rclpy.spin_until_future_complete because
+        the node is already being spun by a MultiThreadedExecutor. Calling
+        spin_until_future_complete from within an executor callback causes
+        the service response to never be sent back.
+        """
         future = client.call_async(request)
-        rclpy.spin_until_future_complete(self, future, timeout_sec=SERVICE_TIMEOUT_SEC)
-        if not future.done():
-            self.get_logger().error(f"Service {name} timed out")
-            return None
+        t0 = time.monotonic()
+        while not future.done():
+            time.sleep(0.05)
+            if time.monotonic() - t0 > SERVICE_TIMEOUT_SEC:
+                self.get_logger().error(f"Service {name} timed out")
+                return None
         return future.result()
 
     def _delete_entity(self, entity_name: str) -> bool:
@@ -312,7 +320,7 @@ class EnvResetter(Node):
         self._joints_stable.clear()
         settled = self._joints_stable.wait(timeout=STABILIZE_TIMEOUT_SEC)
         if not settled:
-            self.get_logger().warn("Robot did not stabilize within timeout")
+            self.get_logger().warning("Robot did not stabilize within timeout")
         return settled
 
     def _reset_callback(self, request, response):
