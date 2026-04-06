@@ -49,7 +49,7 @@ from geometry_msgs.msg import Pose, Point, Quaternion, Twist, Vector3, Wrench
 from sensor_msgs.msg import JointState
 from geometry_msgs.msg import WrenchStamped
 from std_msgs.msg import String, Header
-from std_srvs.srv import Trigger
+from std_srvs.srv import SetBool, Trigger
 
 logger = logging.getLogger(__name__)
 
@@ -147,6 +147,9 @@ class AICGymEnvConfig:
     # Node name
     node_name: str = "aic_gym_env"
 
+    # Whether env.reset() should use a randomly sampled trial config
+    random_reset: bool = False
+
 
 class AICGymEnv(gym.Env):
     """Gymnasium environment wrapping the AIC robot arm simulation."""
@@ -225,7 +228,7 @@ class AICGymEnv(gym.Env):
             ChangeTargetMode, "/aic_controller/change_target_mode",
         )
         self._reset_env_client = self._node.create_client(
-            Trigger, "/env/reset",
+            SetBool, "/env/reset",
         )
 
         # --- Start spinner ---
@@ -259,9 +262,10 @@ class AICGymEnv(gym.Env):
         self._step_count = 0
         self._last_insertion_event = 0.0
 
-        # Call reset service
+        # Call reset service (data=True → random reset from config trials)
         if self._reset_env_client.wait_for_service(timeout_sec=5.0):
-            req = Trigger.Request()
+            req = SetBool.Request()
+            req.data = self.config.random_reset
             future = self._reset_env_client.call_async(req)
 
             # Wait for result
