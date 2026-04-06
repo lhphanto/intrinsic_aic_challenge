@@ -149,6 +149,7 @@ def generate_task_board_urdf(task_board_cfg: dict, limits: dict) -> str:
             present = cfg.get("entity_present", False)
             args.append(f"nic_card_mount_{i}_present:={'true' if present else 'false'}")
             if present:
+                print(f"insert NIC card {i}")
                 ep = cfg.get("entity_pose", {})
                 t = max(nic_min, min(nic_max, float(ep.get("translation", 0.0))))
                 args += [
@@ -164,6 +165,7 @@ def generate_task_board_urdf(task_board_cfg: dict, limits: dict) -> str:
             present = cfg.get("entity_present", False)
             args.append(f"sc_port_{i}_present:={'true' if present else 'false'}")
             if present:
+                print(f"insert SC rail {i}")
                 ep = cfg.get("entity_pose", {})
                 t = max(sc_min, min(sc_max, float(ep.get("translation", 0.0))))
                 args += [
@@ -290,17 +292,18 @@ class EnvResetter(Node):
             self._cable_sdfs[default_ct] = generate_cable_sdf(default_ct, attach)
 
         # Load trial configs and task board limits from sample_config.yaml for random reset
-        self._trials: list[dict] = []
+        self._trials: list[tuple[str, dict]] = []  # (trial_name, trial_dict)
         self._task_board_limits: dict = {}
         config_path = self.get_parameter("config_path").value
         if config_path:
             try:
                 with open(config_path) as f:
                     cfg = yaml.safe_load(f)
-                self._trials = list(cfg.get("trials", {}).values())
+                self._trials = list(cfg.get("trials", {}).items())
                 self._task_board_limits = cfg.get("task_board_limits", {})
                 self.get_logger().info(
-                    f"Loaded {len(self._trials)} trials from {config_path}"
+                    f"Loaded {len(self._trials)} trials from {config_path}: "
+                    f"{[name for name, _ in self._trials]}"
                 )
             except Exception as e:
                 self.get_logger().warn(f"Failed to load config '{config_path}': {e}")
@@ -310,6 +313,11 @@ class EnvResetter(Node):
             SetBool, "/env/reset", self._reset_callback,
             callback_group=self._cb_group,
         )
+
+        # Track the actual entity name returned by the last successful cable spawn.
+        # Gazebo may rename entities (e.g. cable_0 → cable_0_0) when allow_renaming=True,
+        # so we must delete by the name Gazebo assigned, not the name we requested.
+        self._last_cable_name: str | None = None
 
         # Track whether this is the first reset (skip delete on first call
         # if entities were spawned by the launch file)
@@ -480,6 +488,7 @@ class EnvResetter(Node):
             )
             return False
 
+        self._last_cable_name = resp.entity_name
         self.get_logger().info(f"Cable spawned as '{resp.entity_name}'")
         return True
 
@@ -534,14 +543,14 @@ class EnvResetter(Node):
             self.get_logger().warning("Robot did not stabilize within timeout")
         return settled
 
-    def _pick_random_trial(self) -> dict | None:
-        """Pick a random trial from the loaded config. Returns the full trial dict,
-        or None if no trials are loaded."""
+    def _pick_random_trial(self) -> tuple[str, dict] | tuple[None, None]:
+        """Pick a random trial from the loaded config.
+        Returns (trial_name, trial_dict), or (None, None) if no trials are loaded."""
         if not self._trials:
             self.get_logger().warn(
                 "Random reset requested but no trials loaded (set config_path parameter)"
             )
-            return None
+            return None, None
         return random.choice(self._trials)
 
     def _cable_config_from_trial(self, trial: dict) -> dict | None:
@@ -579,33 +588,38 @@ class EnvResetter(Node):
         )
 
         trial: dict | None = None
+        trial_name: str | None = None
         cable_override: dict | None = None
         task_board_cfg: dict | None = None
 
         if random_reset:
-            trial = self._pick_random_trial()
+            trial_name, trial = self._pick_random_trial()
             if trial:
                 cable_override = self._cable_config_from_trial(trial)
                 task_board_cfg = trial.get("scene", {}).get("task_board")
                 self.get_logger().info(
-                    f"Random reset: cable='{cable_override['entity_name'] if cable_override else 'default'}' "
-                    f"type='{cable_override['cable_type'] if cable_override else 'default'}', "
+                    f"Random reset: picked trial '{trial_name}' | "
+                    f"cable='{cable_override['entity_name'] if cable_override else 'default'}' "
+                    f"type='{cable_override['cable_type'] if cable_override else 'default'}' | "
                     f"task_board_pose={task_board_cfg.get('pose') if task_board_cfg else 'none'}"
                 )
 
         success = True
         message_parts = []
 
-        # Step 1: Delete cable
-        entity_name = (
+        # Step 1: Delete cable.
+        # Always delete by _last_cable_name (the name Gazebo actually assigned on the
+        # previous spawn). Falling back to the requested name only on the very first reset
+        # when no cable has been spawned by this node yet.
+        entity_to_delete = self._last_cable_name or (
             cable_override["entity_name"]
             if cable_override
             else self.get_parameter("cable_entity_name").value
         )
-        self.get_logger().info(f"Step 1: Deleting cable '{entity_name}'...")
-        if not self._delete_entity(entity_name):
+        self.get_logger().info(f"Step 1: Deleting cable '{entity_to_delete}'...")
+        if not self._delete_entity(entity_to_delete):
             message_parts.append("cable deletion failed (may not exist)")
-            # Not fatal - cable might not exist yet
+            # Not fatal - cable might not exist on first reset
 
         # Step 2: Delete task board
         #   - always for random reset (we'll re-spawn with new scene config)
