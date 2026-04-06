@@ -31,6 +31,7 @@ def main():
         control_mode="cartesian",
         control_freq_hz=10.0,
         max_episode_steps=600,  # 60 seconds at 10 Hz
+        random_reset=True,
     )
 
     env = AICGymEnv(config=config)
