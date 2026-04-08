@@ -21,6 +21,7 @@ Usage:
     env.close()
 """
 
+import json
 import logging
 import math
 import time
@@ -161,6 +162,7 @@ class AICGymEnv(gym.Env):
         self.config = config or AICGymEnvConfig()
         self._step_count = 0
         self._step_period = 1.0 / self.config.control_freq_hz
+        self._current_task_info: dict[str, Any] = {}
 
         # Initialize ROS2
         if not rclpy.ok():
@@ -280,8 +282,16 @@ class AICGymEnv(gym.Env):
                 result = future.result()
                 if result and not result.success:
                     self._node.get_logger().error(f"Reset failed: {result.message}")
+                    self._current_task_info = {}
                 else:
-                    self._node.get_logger().info("Environment reset successful")
+                    # response.message contains JSON-encoded task details on success
+                    try:
+                        self._current_task_info = json.loads(result.message) if result else {}
+                    except (json.JSONDecodeError, TypeError):
+                        self._current_task_info = {}
+                    self._node.get_logger().info(
+                        f"Environment reset successful | task_info={self._current_task_info}"
+                    )
         else:
             self._node.get_logger().warn(
                 "/env/reset service not available. "
@@ -453,6 +463,7 @@ class AICGymEnv(gym.Env):
         info: dict[str, Any] = {
             "step": self._step_count,
             "insertion_event": self._last_insertion_event,
+            "task": self._current_task_info,
         }
 
         cs = self._last_controller_state

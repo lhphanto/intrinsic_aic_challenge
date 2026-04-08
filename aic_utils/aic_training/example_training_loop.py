@@ -45,6 +45,7 @@ def main():
         obs, info = env.reset()
         print(f"Initial obs shape: {obs.shape}")
         print(f"TCP position: ({obs[0]:.4f}, {obs[1]:.4f}, {obs[2]:.4f})")
+        print(f"Task info: {info['task']}")
 
         episode_reward = 0.0
         step = 0
