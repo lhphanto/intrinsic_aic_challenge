@@ -689,6 +689,7 @@ class EnvResetter(Node):
                         f"type='{cable_override['cable_type'] if cable_override else 'default'}'"
                     )
                     task_board_cfg, target_rail = self._randomize_sfp_trial_board(task_board_cfg)
+                    port_name = random.choice(["sfp_port_0", "sfp_port_1"])
                     task_info = {
                         "trial_name": trial_name,
                         "cable_type": base_task.get("cable_type", "sfp_sc"),
@@ -696,7 +697,7 @@ class EnvResetter(Node):
                         "plug_type": base_task.get("plug_type", "sfp"),
                         "plug_name": base_task.get("plug_name", "sfp_tip"),
                         "port_type": base_task.get("port_type", "sfp"),
-                        "port_name": base_task.get("port_name", "sfp_port_0"),
+                        "port_name": port_name,
                         "target_module_name": f"nic_card_mount_{target_rail}",
                         "time_limit": base_task.get("time_limit", 180),
                     }

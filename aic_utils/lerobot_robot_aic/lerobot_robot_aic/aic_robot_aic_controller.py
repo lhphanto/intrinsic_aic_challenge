@@ -16,6 +16,7 @@
 
 """LeRobot driver for AIC robot: derived from https://github.com/huggingface/lerobot/blob/main/src/lerobot/robots/robot.py"""
 
+import json
 import logging
 import time
 from dataclasses import dataclass, field
@@ -36,6 +37,7 @@ from aic_control_interfaces.msg import (
     TrajectoryGenerationMode,
 )
 from aic_control_interfaces.srv import ChangeTargetMode
+from std_srvs.srv import SetBool
 from geometry_msgs.msg import Twist, Vector3, Wrench, WrenchStamped
 from lerobot.cameras import CameraConfig, make_cameras_from_configs
 from lerobot.robots import Robot, RobotConfig
@@ -136,6 +138,7 @@ class AICRos2Interface:
     change_target_mode_client: Client[
         ChangeTargetMode.Request, ChangeTargetMode.Response
     ]
+    env_reset_client: Client[SetBool.Request, SetBool.Response]
     motion_update_pub: Publisher[MotionUpdate]
     joint_motion_update_pub: Publisher[JointMotionUpdate]
     controller_state_sub: Subscription[ControllerState]
@@ -192,6 +195,10 @@ class AICRos2Interface:
             String, "/scoring/insertion_event", insertion_event_cb, 10
         )
 
+        # Client for /env/reset (env_resetter.py). Not waited on here —
+        # the service lives in a separate process and may start later.
+        env_reset_client = node.create_client(SetBool, "/env/reset")
+
         executor = SingleThreadedExecutor()
         executor.add_node(node)
         executor_thread = Thread(target=executor.spin, daemon=True)
@@ -203,6 +210,7 @@ class AICRos2Interface:
             executor=executor,
             executor_thread=executor_thread,
             change_target_mode_client=change_target_mode_client,
+            env_reset_client=env_reset_client,
             motion_update_pub=motion_update_pub,
             joint_motion_update_pub=joint_motion_update_pub,
             controller_state_sub=controller_state_sub,
@@ -229,6 +237,11 @@ class AICRobotAICController(Robot):
         self.fts_tare_offset: WrenchStamped = WrenchStamped()
 
         self._is_connected = False
+
+        # Auto-reset on insertion event
+        self._auto_reset_enabled: bool = False
+        self._auto_reset_teleop: Any = None
+        self._auto_reset_pending: bool = False
 
         if config.teleop_frame_id not in ["gripper/tcp", "base_link"]:
             raise ValueError(
@@ -333,7 +346,13 @@ class AICRobotAICController(Robot):
         def insertion_event_cb(msg: String):
             if msg.data:
                 print(f"Insertion event: {msg.data}")
+            prev = self.last_insertion_event
             self.last_insertion_event = 1.0 if msg.data else 0.0
+            # Rising edge: 0 → 1. Spawn reset thread if auto-reset is enabled.
+            if self.last_insertion_event == 1.0 and prev != 1.0:
+                if self._auto_reset_enabled and not self._auto_reset_pending:
+                    self._auto_reset_pending = True
+                    Thread(target=self._auto_reset_after_delay, daemon=True).start()
 
         self.ros2_interface = AICRos2Interface.connect(
             controller_state_cb, joint_states_cb, wrench_cb, insertion_event_cb
@@ -508,6 +527,82 @@ class AICRobotAICController(Robot):
             return action
         else:
             raise ValueError("Invalid teleop_target_mode")
+
+    def enable_auto_reset(self, teleop=None) -> None:
+        """Enable automatic env reset 2 s after each insertion event.
+
+        Args:
+            teleop: optional teleoperator (e.g. AICCheatCodeTeleop). If provided,
+                    update_task() is called on it with the new task_info after reset.
+        """
+        self._auto_reset_teleop = teleop
+        self._auto_reset_enabled = True
+        logger.info("Auto-reset enabled — will reset 2 s after each insertion event.")
+
+    def disable_auto_reset(self) -> None:
+        """Disable automatic env reset."""
+        self._auto_reset_enabled = False
+        logger.info("Auto-reset disabled.")
+
+    def _auto_reset_after_delay(self, delay: float = 2.0) -> None:
+        """Background thread: wait `delay` seconds then call reset()."""
+        time.sleep(delay)
+        try:
+            self.reset(teleop=self._auto_reset_teleop)
+        finally:
+            self._auto_reset_pending = False
+
+    def reset(self, teleop=None) -> dict:
+        """Trigger a random environment reset via the /env/reset service.
+
+        Calls env_resetter.py with data=True (random reset). Parses the JSON
+        task_info from the response and — if teleop exposes an update_task()
+        method (i.e. AICCheatCodeTeleop) — forwards the new targets to it so
+        the cheatcode uses the correct port/module for the upcoming episode.
+
+        Args:
+            teleop: optional teleoperator instance. If it has update_task(),
+                    it will be called with the new task_info.
+
+        Returns:
+            task_info dict (may be empty if reset failed or resetter is unavailable).
+        """
+        if not self.ros2_interface:
+            raise DeviceNotConnectedError()
+
+        client = self.ros2_interface.env_reset_client
+        if not client.wait_for_service(timeout_sec=10.0):
+            logger.warning("/env/reset service not available — is env_resetter.py running?")
+            return {}
+
+        req = SetBool.Request()
+        req.data = True  # random reset
+
+        future = client.call_async(req)
+        t0 = time.monotonic()
+        while not future.done():
+            time.sleep(0.05)
+            if time.monotonic() - t0 > 120.0:
+                logger.error("/env/reset timed out after 120 s")
+                return {}
+
+        result = future.result()
+        if result is None or not result.success:
+            logger.error(f"Environment reset failed: {getattr(result, 'message', 'no response')}")
+            return {}
+
+        try:
+            task_info = json.loads(result.message)
+        except (json.JSONDecodeError, TypeError):
+            task_info = {}
+
+        logger.info(f"Environment reset complete. task_info={task_info}")
+
+        # Duck-typed update: works for AICCheatCodeTeleop without a circular import.
+        if task_info and teleop is not None and hasattr(teleop, "update_task"):
+            teleop.update_task(task_info)
+
+        return task_info
 
     def disconnect(self) -> None:
         if not self.is_connected:
