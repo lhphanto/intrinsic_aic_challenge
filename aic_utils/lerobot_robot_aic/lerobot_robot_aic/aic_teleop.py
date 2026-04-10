@@ -436,6 +436,38 @@ class AICCheatCodeTeleop(Teleoperator):
     def configure(self) -> None:
         pass
 
+    def update_task(self, task_info: dict) -> None:
+        """Update insertion targets from a task_info dict returned by robot.reset().
+
+        Updates the relevant config fields so get_action() targets the correct
+        port/module for the new episode, then resets the state machine and PI
+        integrator so the episode starts clean.
+
+        Keys consumed from task_info:
+            target_module_name → config.task_module_name
+            port_name          → config.task_port_name
+            cable_name         → config.task_cable_name
+            plug_name          → config.task_plug_name
+        """
+        if "target_module_name" in task_info:
+            self.config.task_module_name = task_info["target_module_name"]
+        if "port_name" in task_info:
+            self.config.task_port_name = task_info["port_name"]
+        if "cable_name" in task_info:
+            self.config.task_cable_name = task_info["cable_name"]
+        if "plug_name" in task_info:
+            self.config.task_plug_name = task_info["plug_name"]
+
+        # Reset state machine and integrator for the fresh episode
+        self.phase = "INIT"
+        self._lin_err_integrator = np.zeros(3)
+
+        print(
+            f"CheatCode task updated: "
+            f"{self.config.task_module_name}/{self.config.task_port_name} | "
+            f"cable={self.config.task_cable_name} plug={self.config.task_plug_name}"
+        )
+
     def _get_transform(self, target_frame: str, source_frame: str):
         """Helper to get transforms without throwing exceptions in the main loop."""
         try:
