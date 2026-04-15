@@ -15,14 +15,16 @@
 #
 
 from dataclasses import dataclass, field
-from threading import Thread
+from threading import Event, Thread
 from typing import Any, cast
-
+import json
+import logging
 import numpy as np
 
 import pyspacemouse
 import rclpy
 from geometry_msgs.msg import Twist
+from std_msgs.msg import String
 from lerobot.teleoperators import Teleoperator, TeleoperatorConfig
 from lerobot.teleoperators.keyboard import (
     KeyboardEndEffectorTeleop,
@@ -40,6 +42,11 @@ from scipy.spatial.transform import Rotation as R
 from tf2_ros import Buffer, TransformListener
 from transforms3d._gohlketransforms import quaternion_multiply
 
+logger = logging.getLogger(__name__)
+
+# Set by the robot controller during reset() so that get_action() returns zero
+# actions while the environment is being reset.
+reset_in_progress: Event = Event()
 
 
 @TeleoperatorConfig.register_subclass("aic_keyboard_joint")
@@ -378,6 +385,8 @@ class AICCheatCodeTeleop(Teleoperator):
         
         # State machine variables
         self.phase = "INIT"  # INIT -> APPROACH -> INSERT -> DONE
+        # 20 cm of clearance above the port. It's an empirical hover height chosen to be far enough above the port 
+        # that the gripper can safely approach from any position without hitting anything, before descending.
         self.z_offset = 0.2
         self.start_time = 0.0  # Must be 0.0 here, _node doesn't exist yet!
         
@@ -406,6 +415,7 @@ class AICCheatCodeTeleop(Teleoperator):
         return self._is_connected
 
     def connect(self, calibrate: bool = True) -> None:
+        logger.info("LXH teleop connect")
         if self.is_connected:
             raise DeviceAlreadyConnectedError()
 
@@ -416,6 +426,12 @@ class AICCheatCodeTeleop(Teleoperator):
         self._node = rclpy.create_node("cheatcode_teleop")
         self._tf_buffer = Buffer()
         self._tf_listener = TransformListener(self._tf_buffer, self._node)
+
+        # Subscribe to task_info published by the robot after each env reset.
+        # This lets the teleop update its targets without needing a robot reference.
+        self._node.create_subscription(
+            String, "/env/task_info", self._task_info_cb, 10
+        )
 
         self._executor = SingleThreadedExecutor()
         self._executor.add_node(self._node)
@@ -435,6 +451,14 @@ class AICCheatCodeTeleop(Teleoperator):
 
     def configure(self) -> None:
         pass
+
+    def _task_info_cb(self, msg: String) -> None:
+        """Handle task_info published by the robot after each env reset."""
+        try:
+            task_info = json.loads(msg.data)
+            self.update_task(task_info)
+        except (json.JSONDecodeError, TypeError) as e:
+            logger.warning(f"Failed to parse /env/task_info message: {e}")
 
     def update_task(self, task_info: dict) -> None:
         """Update insertion targets from a task_info dict returned by robot.reset().
@@ -458,11 +482,12 @@ class AICCheatCodeTeleop(Teleoperator):
         if "plug_name" in task_info:
             self.config.task_plug_name = task_info["plug_name"]
 
-        # Reset state machine and integrator for the fresh episode
+        # Reset state machine, z_offset, and integrator for the fresh episode
         self.phase = "INIT"
+        self.z_offset = 0.2
         self._lin_err_integrator = np.zeros(3)
 
-        print(
+        logger.info(
             f"CheatCode task updated: "
             f"{self.config.task_module_name}/{self.config.task_port_name} | "
             f"cable={self.config.task_cable_name} plug={self.config.task_plug_name}"
@@ -475,15 +500,80 @@ class AICCheatCodeTeleop(Teleoperator):
         except Exception:
             return None
 
+    def calc_gripper_pose(
+        self,
+        port_tf,
+        plug_tf,
+        gripper_tf,
+        z_offset: float = 0.0,
+    ) -> tuple[np.ndarray, tuple[float, float, float, float]]:
+        """Compute target gripper position and orientation for plug alignment.
+
+        Mirrors CheatCode.calc_gripper_pose() adapted for velocity control.
+        Takes pre-looked-up TransformStamped values so the caller can handle
+        lookup failures before invoking this method.
+
+        Args:
+            port_tf:    TransformStamped of the target port in base_link frame.
+            plug_tf:    TransformStamped of the cable plug tip in base_link frame.
+            gripper_tf: TransformStamped of the gripper TCP in base_link frame.
+            z_offset:   Extra height above the port to target (metres).
+
+        Returns:
+            (target_pos, q_gripper_target): world-frame target position as a
+            (3,) array and target gripper quaternion as (w, x, y, z).
+        """
+        q_port = (
+            port_tf.transform.rotation.w, port_tf.transform.rotation.x,
+            port_tf.transform.rotation.y, port_tf.transform.rotation.z,
+        )
+        q_plug = (
+            plug_tf.transform.rotation.w, plug_tf.transform.rotation.x,
+            plug_tf.transform.rotation.y, plug_tf.transform.rotation.z,
+        )
+        q_plug_inv = (-q_plug[0], q_plug[1], q_plug[2], q_plug[3])
+        q_diff = quaternion_multiply(q_port, q_plug_inv)
+
+        q_gripper = (
+            gripper_tf.transform.rotation.w, gripper_tf.transform.rotation.x,
+            gripper_tf.transform.rotation.y, gripper_tf.transform.rotation.z,
+        )
+        q_gripper_target = quaternion_multiply(q_diff, q_gripper)
+
+        gripper_pos = np.array([
+            gripper_tf.transform.translation.x,
+            gripper_tf.transform.translation.y,
+            gripper_tf.transform.translation.z,
+        ])
+        plug_pos = np.array([
+            plug_tf.transform.translation.x,
+            plug_tf.transform.translation.y,
+            plug_tf.transform.translation.z,
+        ])
+        plug_offset = gripper_pos - plug_pos
+
+        target_pos = np.array([
+            port_tf.transform.translation.x + plug_offset[0],
+            port_tf.transform.translation.y + plug_offset[1],
+            port_tf.transform.translation.z + plug_offset[2] + z_offset,
+        ])
+
+        return target_pos, q_gripper_target
+
     def get_action(self) -> dict[str, Any]:
         if not self.is_connected:
             raise DeviceNotConnectedError()
 
-        # 1. Define required TF frames from config
+        # Pause actions during env reset to avoid destabilizing the robot.
+        if reset_in_progress.is_set():
+            for key in self._current_actions:
+                self._current_actions[key] = 0.0
+            return cast(dict, self._current_actions)
+
+        # 1. Look up current transforms
         port_frame = f"task_board/{self.config.task_module_name}/{self.config.task_port_name}_link"
         cable_tip_frame = f"{self.config.task_cable_name}/{self.config.task_plug_name}_link"
 
-        # 2. Look up current transforms
         port_tf = self._get_transform("base_link", port_frame)
         plug_tf = self._get_transform("base_link", cable_tip_frame)
         gripper_tf = self._get_transform("base_link", "gripper/tcp")
@@ -499,56 +589,33 @@ class AICCheatCodeTeleop(Teleoperator):
 
         # Transition out of INIT once TFs are found
         if self.phase == "INIT":
-            print("\nTFs found! Starting APPROACH phase.")
+            logger.info("\nTFs found! Starting APPROACH phase.")
             self.phase = "APPROACH"
-            self.start_time = self._node.get_clock().now().nanoseconds / 1e9 # Fixed to use ROS time
+            self.start_time = self._node.get_clock().now().nanoseconds / 1e9
 
-        # 3. Calculate target orientation
-        q_port = (
-            port_tf.transform.rotation.w, port_tf.transform.rotation.x,
-            port_tf.transform.rotation.y, port_tf.transform.rotation.z
+        # 2. Compute target pose (position + orientation)
+        target_pos, q_gripper_target = self.calc_gripper_pose(
+            port_tf, plug_tf, gripper_tf, z_offset=self.z_offset
         )
-        q_plug = (
-            plug_tf.transform.rotation.w, plug_tf.transform.rotation.x,
-            plug_tf.transform.rotation.y, plug_tf.transform.rotation.z
-        )
-        q_plug_inv = (-q_plug[0], q_plug[1], q_plug[2], q_plug[3])
-        q_diff = quaternion_multiply(q_port, q_plug_inv)
 
-        q_gripper = (
-            gripper_tf.transform.rotation.w, gripper_tf.transform.rotation.x,
-            gripper_tf.transform.rotation.y, gripper_tf.transform.rotation.z
-        )
-        q_gripper_target = quaternion_multiply(q_diff, q_gripper)
-
-        # 4. Calculate target position
         gripper_pos = np.array([
             gripper_tf.transform.translation.x,
             gripper_tf.transform.translation.y,
-            gripper_tf.transform.translation.z
+            gripper_tf.transform.translation.z,
         ])
-        plug_pos = np.array([
-            plug_tf.transform.translation.x,
-            plug_tf.transform.translation.y,
-            plug_tf.transform.translation.z
-        ])
-        plug_offset = gripper_pos - plug_pos
+        q_gripper = (
+            gripper_tf.transform.rotation.w, gripper_tf.transform.rotation.x,
+            gripper_tf.transform.rotation.y, gripper_tf.transform.rotation.z,
+        )
 
-        # Base target is the port position + the offset of how the gripper holds the plug
-        target_pos = np.array([
-            port_tf.transform.translation.x + plug_offset[0],
-            port_tf.transform.translation.y + plug_offset[1],
-            port_tf.transform.translation.z + plug_offset[2] + self.z_offset
-        ])
-
-        # 5. State Machine Logic
+        # 3. State Machine Logic
         current_time = self._node.get_clock().now().nanoseconds / 1e9
         elapsed = current_time - self.start_time
         dist_to_target = np.linalg.norm(target_pos - gripper_pos)
 
         if self.phase == "APPROACH":
             if dist_to_target < 0.01 and elapsed > 2.0:
-                print("Hover position reached. Starting INSERT phase.")
+                logger.info("Hover position reached. Starting INSERT phase.")
                 self.phase = "INSERT"
                 self.start_time = current_time
                 self._lin_err_integrator = np.zeros(3)
@@ -563,7 +630,7 @@ class AICCheatCodeTeleop(Teleoperator):
             z_error = abs(target_pos[2] - gripper_pos[2])
 
             if self.z_offset <= -0.015 and z_error < 0.005:
-                print("Insertion complete. DONE phase.")
+                logger.info("Insertion complete. DONE phase.")
                 self.phase = "DONE"
 
         elif self.phase == "DONE":
@@ -571,12 +638,12 @@ class AICCheatCodeTeleop(Teleoperator):
                 self._current_actions[key] = 0.0
             return cast(dict, self._current_actions)
 
-        # 6. Proportional-Integral (PI) Velocity Controller (World Frame)
+        # 4. Proportional-Integral (PI) Velocity Controller (World Frame → TCP Frame)
         lin_err = target_pos - gripper_pos
         self._lin_err_integrator = np.clip(
             self._lin_err_integrator + lin_err,
             -self.config.max_integrator_windup,
-            self.config.max_integrator_windup
+            self.config.max_integrator_windup,
         )
 
         v_linear_world = (self.config.kp_linear * lin_err) + (self.config.ki_linear * self._lin_err_integrator)
@@ -588,11 +655,10 @@ class AICCheatCodeTeleop(Teleoperator):
         r_error = r_target * r_current.inv()
         v_angular_world = np.clip(self.config.kp_angular * r_error.as_rotvec(), -self.config.max_angular_vel, self.config.max_angular_vel)
 
-        # FIX: Transform World-Frame velocities into TCP-Frame velocities
         v_linear_tcp = r_current.inv().apply(v_linear_world)
         v_angular_tcp = r_current.inv().apply(v_angular_world)
 
-        # 7. Map to LeRobot action dict using the TCP-Frame velocities
+        # 5. Map to LeRobot action dict using the TCP-Frame velocities
         self._current_actions = {
             "linear.x": float(v_linear_tcp[0]),
             "linear.y": float(v_linear_tcp[1]),
@@ -608,6 +674,7 @@ class AICCheatCodeTeleop(Teleoperator):
         pass
 
     def disconnect(self) -> None:
+        logger.info("LXH teleop disconnected")
         self._is_connected = False
         if hasattr(self, '_node'):
             self._node.destroy_node()

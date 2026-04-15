@@ -89,6 +89,9 @@ JOINT_VELOCITY_THRESHOLD = 1e-3
 # These are SFP insertion trials (SFP_MODULE → SFP_PORT via NIC card).
 PROCEDURALLY_RANDOMIZED_TRIALS = {"trial_1", "trial_2"}
 
+# SC port insertion trials (trial_3: SC_TIP → SC_PORT via SC port on rail).
+SC_RANDOMIZED_TRIALS = {"trial_3"}
+
 # Board pose bounds for procedurally randomized trials.
 # Chosen so the target NIC port stays within robot camera view.
 RANDOM_BOARD_X_RANGE = (0.12, 0.22)   # meters, forward distance from robot base
@@ -100,6 +103,11 @@ RANDOM_BOARD_YAW_RANGE = (2.8, 3.4)   # radians, facing roughly toward robot (ar
 RANDOM_NIC_MIN_COUNT = 1   # always at least 1 NIC card (the insertion target)
 RANDOM_NIC_MAX_COUNT = 3   # at most 3 NIC cards simultaneously
 RANDOM_NIC_YAW_RANGE = (-0.15, 0.15)  # radians, small yaw offset per card
+
+# SC port randomization for trial_3.
+# SC_PORT_0 is placed on SC_RAIL_0, SC_PORT_1 on SC_RAIL_1 (when present).
+# Either one or both ports may be present; exactly one is the target.
+RANDOM_SC_YAW_RANGE = (-0.15, 0.15)   # radians, small yaw offset per SC port
 
 
 def rpy_to_quaternion(roll: float, pitch: float, yaw: float):
@@ -569,6 +577,8 @@ class EnvResetter(Node):
                 "Random reset requested but no trials loaded (set config_path parameter)"
             )
             return None, None
+
+        #return self._trials[-1]
         return random.choice(self._trials)
 
     def _cable_config_from_trial(self, trial: dict) -> dict | None:
@@ -653,6 +663,94 @@ class EnvResetter(Node):
         )
         return cfg, target_rail
 
+    def _randomize_sc_trial_board(
+        self, base_cfg: dict
+    ) -> tuple[dict, int]:
+        """Return (randomized_cfg, target_sc_rail_idx) for SC port insertion trials (trial_3).
+
+        Randomizes:
+          - Board pose: x, y (within RANDOM_BOARD_*_RANGE), yaw (within RANDOM_BOARD_YAW_RANGE).
+            z, roll, pitch are fixed.
+          - SC rails: either one or both SC ports are present.
+            SC_PORT_0 is always on SC_RAIL_0; SC_PORT_1 is always on SC_RAIL_1.
+            Each present port gets a random translation (clamped to sc_rail limits)
+            and a small random yaw offset.
+          - NIC rails: RANDOM_NIC_MIN_COUNT..RANDOM_NIC_MAX_COUNT NIC cards are placed as
+            distractors (same randomization as SFP trials; none are the insertion target).
+          - Target: one of the present SC rails is randomly chosen as the insertion target.
+
+        Mount rails are copied unchanged from base_cfg.
+        """
+        cfg = copy.deepcopy(base_cfg)
+
+        # --- Board pose ---
+        new_x = random.uniform(*RANDOM_BOARD_X_RANGE)
+        new_y = random.uniform(*RANDOM_BOARD_Y_RANGE)
+        new_yaw = random.uniform(*RANDOM_BOARD_YAW_RANGE)
+        cfg["pose"] = {
+            "x": new_x,
+            "y": new_y,
+            "z": RANDOM_BOARD_Z,
+            "roll": 0.0,
+            "pitch": 0.0,
+            "yaw": new_yaw,
+        }
+
+        # --- SC rails ---
+        sc_lim = self._task_board_limits.get("sc_rail", {})
+        sc_min = float(sc_lim.get("min_translation", -0.06))
+        sc_max = float(sc_lim.get("max_translation", 0.055))
+
+        # Randomly decide which SC ports are present (at least 1, at most both).
+        num_sc = random.randint(1, 2)
+        chosen_sc_rails = sorted(random.sample([0, 1], num_sc))
+        target_sc_rail = random.choice(chosen_sc_rails)
+
+        for i in range(2):
+            if i in chosen_sc_rails:
+                cfg[f"sc_rail_{i}"] = {
+                    "entity_present": True,
+                    "entity_name": f"sc_mount_{i}",
+                    "entity_pose": {
+                        "translation": random.uniform(sc_min, sc_max),
+                        "roll": 0.0,
+                        "pitch": 0.0,
+                        "yaw": random.uniform(*RANDOM_SC_YAW_RANGE),
+                    },
+                }
+            else:
+                cfg[f"sc_rail_{i}"] = {"entity_present": False}
+
+        # --- NIC rails (distractors) ---
+        nic_lim = self._task_board_limits.get("nic_rail", {})
+        nic_min = float(nic_lim.get("min_translation", -0.0215))
+        nic_max = float(nic_lim.get("max_translation", 0.0234))
+
+        num_nics = random.randint(0, RANDOM_NIC_MAX_COUNT)
+        chosen_nic_rails = sorted(random.sample(range(5), num_nics))
+
+        for i in range(5):
+            if i in chosen_nic_rails:
+                cfg[f"nic_rail_{i}"] = {
+                    "entity_present": True,
+                    "entity_name": f"nic_card_{i}",
+                    "entity_pose": {
+                        "translation": random.uniform(nic_min, nic_max),
+                        "roll": 0.0,
+                        "pitch": 0.0,
+                        "yaw": random.uniform(*RANDOM_NIC_YAW_RANGE),
+                    },
+                }
+            else:
+                cfg[f"nic_rail_{i}"] = {"entity_present": False}
+
+        self.get_logger().info(
+            f"  board pose: x={new_x:.3f} y={new_y:.3f} yaw={new_yaw:.3f} | "
+            f"SC rails populated: {chosen_sc_rails} | target SC rail: {target_sc_rail} | "
+            f"NIC distractors: {chosen_nic_rails}"
+        )
+        return cfg, target_sc_rail
+
     def _reset_callback(self, request: SetBool.Request, response: SetBool.Response):
         """Full environment reset sequence.
 
@@ -682,7 +780,26 @@ class EnvResetter(Node):
 
                 # For trials in PROCEDURALLY_RANDOMIZED_TRIALS, replace the fixed YAML
                 # scene with a freshly randomized one (board pose + NIC rail layout).
-                if trial_name in PROCEDURALLY_RANDOMIZED_TRIALS and task_board_cfg:
+                # For trials in SC_RANDOMIZED_TRIALS, randomize SC port placement instead.
+                if trial_name in SC_RANDOMIZED_TRIALS and task_board_cfg:
+                    self.get_logger().info(
+                        f"Random reset: picked trial '{trial_name}' (SC procedural randomization) | "
+                        f"cable='{cable_override['entity_name'] if cable_override else 'default'}' "
+                        f"type='{cable_override['cable_type'] if cable_override else 'default'}'"
+                    )
+                    task_board_cfg, target_sc_rail = self._randomize_sc_trial_board(task_board_cfg)
+                    task_info = {
+                        "trial_name": trial_name,
+                        "cable_type": base_task.get("cable_type", "sc"),
+                        "cable_name": cable_override["entity_name"] if cable_override else CABLE_ENTITY_NAME,
+                        "plug_type": base_task.get("plug_type", "sc"),
+                        "plug_name": base_task.get("plug_name", "sc_tip"),
+                        "port_type": base_task.get("port_type", "sc"),
+                        "port_name": "sc_port_base",
+                        "target_module_name": f"sc_port_{target_sc_rail}",
+                        "time_limit": base_task.get("time_limit", 180),
+                    }
+                elif trial_name in PROCEDURALLY_RANDOMIZED_TRIALS and task_board_cfg:
                     self.get_logger().info(
                         f"Random reset: picked trial '{trial_name}' (procedural randomization) | "
                         f"cable='{cable_override['entity_name'] if cable_override else 'default'}' "
@@ -724,14 +841,11 @@ class EnvResetter(Node):
         message_parts = []
 
         # Step 1: Delete cable.
-        # Always delete by _last_cable_name (the name Gazebo actually assigned on the
-        # previous spawn). Falling back to the requested name only on the very first reset
-        # when no cable has been spawned by this node yet.
-        entity_to_delete = self._last_cable_name or (
-            cable_override["entity_name"]
-            if cable_override
-            else self.get_parameter("cable_entity_name").value
-        )
+        # Always delete by _last_cable_name (the actual Gazebo-assigned name from the
+        # previous spawn by this node). On the very first reset, _last_cable_name is None
+        # so fall back to the cable_entity_name ROS param — that is the name used by the
+        # launch file, and is independent of whichever trial was just picked.
+        entity_to_delete = self._last_cable_name or self.get_parameter("cable_entity_name").value
         self.get_logger().info(f"Step 1: Deleting cable '{entity_to_delete}'...")
         if not self._delete_entity(entity_to_delete):
             message_parts.append("cable deletion failed (may not exist)")
