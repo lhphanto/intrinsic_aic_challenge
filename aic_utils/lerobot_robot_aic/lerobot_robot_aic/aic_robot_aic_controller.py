@@ -19,9 +19,11 @@
 import json
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from functools import cached_property
-from threading import Thread
+from threading import Event, Thread
+
 from typing import Any, Callable, TypedDict, cast
 
 import math
@@ -54,10 +56,31 @@ from sensor_msgs.msg import JointState
 from std_msgs.msg import String
 
 from .aic_robot import aic_cameras, arm_joint_names
+from .aic_teleop import AICCheatCodeTeleopConfig, reset_in_progress
 from .types import JointMotionUpdateActionDict, MotionUpdateActionDict
 
 logger = logging.getLogger(__name__)
 
+
+# Encoding maps for task observation integers
+TASK_TARGET_MODULE_ENCODING: dict[str, int] = {
+    "nic_card_mount_0": 0,
+    "nic_card_mount_1": 1,
+    "nic_card_mount_2": 2,
+    "nic_card_mount_3": 3,
+    "nic_card_mount_4": 4,
+    "sc_port_0": 5,
+    "sc_port_1": 6,
+    "sc_port_2": 7,
+    "sc_port_3": 8,
+    "sc_port_4": 9,
+}
+
+TASK_PORT_NAME_ENCODING: dict[str, int] = {
+    "sfp_port_0": 0,
+    "sfp_port_1": 1,
+    "sc_port_base": 2,
+}
 
 ObservationState = TypedDict(
     "ObservationState",
@@ -102,6 +125,9 @@ ObservationState = TypedDict(
         "fts_tare_offset.torque.z": float,
         "max_force_magnitude": float,
         "insertion_event": float,
+        "task.target_module": float,  # see TASK_TARGET_MODULE_ENCODING
+        "task.port_name": float,      # see TASK_PORT_NAME_ENCODING
+        "episode_number": float,
     },
 )
 
@@ -117,6 +143,8 @@ class CameraImageScaling(TypedDict):
 class AICRobotAICControllerConfig(RobotConfig):
     teleop_target_mode: str = "cartesian"  # "cartesian" or "joint"
     teleop_frame_id: str = "gripper/tcp"  # "gripper/tcp" or "base_link"
+    auto_reset: bool = False      # if True, trigger env reset 2s after each insertion event
+    episode_timeout_s: float = 60.0  # force reset after this many seconds with no insertion
 
     arm_joint_names: list[str] = field(default_factory=arm_joint_names.copy)
 
@@ -141,6 +169,7 @@ class AICRos2Interface:
     env_reset_client: Client[SetBool.Request, SetBool.Response]
     motion_update_pub: Publisher[MotionUpdate]
     joint_motion_update_pub: Publisher[JointMotionUpdate]
+    task_info_pub: Publisher[String]
     controller_state_sub: Subscription[ControllerState]
     joint_states_sub: Subscription[JointState]
     wrench_sub: Subscription[WrenchStamped]
@@ -199,6 +228,10 @@ class AICRos2Interface:
         # the service lives in a separate process and may start later.
         env_reset_client = node.create_client(SetBool, "/env/reset")
 
+        # Publisher for task info after each reset. Teleop nodes subscribe to
+        # this to update their targets without requiring a direct object reference.
+        task_info_pub = node.create_publisher(String, "/env/task_info", 10)
+
         executor = SingleThreadedExecutor()
         executor.add_node(node)
         executor_thread = Thread(target=executor.spin, daemon=True)
@@ -213,6 +246,7 @@ class AICRos2Interface:
             env_reset_client=env_reset_client,
             motion_update_pub=motion_update_pub,
             joint_motion_update_pub=joint_motion_update_pub,
+            task_info_pub=task_info_pub,
             controller_state_sub=controller_state_sub,
             joint_states_sub=joint_states_sub,
             wrench_sub=wrench_sub,
@@ -237,11 +271,18 @@ class AICRobotAICController(Robot):
         self.fts_tare_offset: WrenchStamped = WrenchStamped()
 
         self._is_connected = False
+        self.current_task_info: dict = {
+            "target_module_name": AICCheatCodeTeleopConfig.task_module_name,
+            "port_name": AICCheatCodeTeleopConfig.task_port_name,
+        }
+        self.episode_number: int = 0
 
-        # Auto-reset on insertion event
+        # Auto-reset on insertion event or episode timeout
         self._auto_reset_enabled: bool = False
-        self._auto_reset_teleop: Any = None
         self._auto_reset_pending: bool = False
+        self._last_reset_time: float = 0.0
+        self._watchdog_stop: Event = Event()
+        self._watchdog_thread: Thread | None = None
 
         if config.teleop_frame_id not in ["gripper/tcp", "base_link"]:
             raise ValueError(
@@ -344,13 +385,29 @@ class AICRobotAICController(Robot):
                 self.max_force_magnitude = magnitude
 
         def insertion_event_cb(msg: String):
-            if msg.data:
-                print(f"Insertion event: {msg.data}")
             prev = self.last_insertion_event
-            self.last_insertion_event = 1.0 if msg.data else 0.0
-            # Rising edge: 0 → 1. Spawn reset thread if auto-reset is enabled.
-            if self.last_insertion_event == 1.0 and prev != 1.0:
+            if not msg.data:
+                # 0: no insertion
+                self.last_insertion_event = 0.0
+            else:
+                target = self.current_task_info.get("target_module_name", "")
+                port = self.current_task_info.get("port_name", "")
+                if target and port and target in msg.data and port in msg.data:
+                    # 2: insertion matches current task
+                    self.last_insertion_event = 2.0
+                    logger.info(f"Insertion event matched task target. msg={msg.data}")
+                else:
+                    # 1: insertion into wrong target
+                    self.last_insertion_event = 1.0
+                    logger.info(
+                        f"Insertion event did NOT match task target. msg={msg.data} "
+                        f"expected target={target!r} port={port!r}"
+                    )
+            # Rising edge: 0 → non-zero. Spawn reset thread if auto-reset is enabled.
+            if self.last_insertion_event > 0.0 and prev == 0.0:
+                logger.info("LXH insertion event detected")
                 if self._auto_reset_enabled and not self._auto_reset_pending:
+                    logger.info("LXH reset trigger start")
                     self._auto_reset_pending = True
                     Thread(target=self._auto_reset_after_delay, daemon=True).start()
 
@@ -369,6 +426,9 @@ class AICRobotAICController(Robot):
             cam.connect()
 
         self._is_connected = True
+
+        if self.config.auto_reset:
+            self.enable_auto_reset()
 
     @property
     def is_calibrated(self) -> bool:
@@ -432,34 +492,46 @@ class AICRobotAICController(Robot):
             "fts_tare_offset.torque.z": self.fts_tare_offset.wrench.torque.z,
             "max_force_magnitude": self.max_force_magnitude,
             "insertion_event": self.last_insertion_event,
+            "episode_number": float(self.episode_number),
+            "task.target_module": float(
+                TASK_TARGET_MODULE_ENCODING.get(
+                    self.current_task_info.get("target_module_name", ""), -1
+                )
+            ),
+            "task.port_name": float(
+                TASK_PORT_NAME_ENCODING.get(
+                    self.current_task_info.get("port_name", ""), -1
+                )
+            ),
         }
 
-        # Capture images from cameras
-        cam_obs: dict[str, NDArray[Any]] = {}
-        for cam_key, cam in self.cameras.items():
+        # Capture images from cameras in parallel to reduce latency
+        def _read_camera(cam_key: str) -> tuple[str, NDArray[Any]]:
+            cam = self.cameras[cam_key]
             try:
                 data = cam.async_read(timeout_ms=2000)
                 if data is not None and data.size > 0:
                     image_scale = self.config.camera_image_scaling[cam_key]
                     if image_scale != 1:
-                        cam_obs[cam_key] = cv2.resize(
+                        return cam_key, cv2.resize(
                             data,
                             None,
                             fx=image_scale,
                             fy=image_scale,
                             interpolation=cv2.INTER_AREA,
                         )
-                    else:
-                        cam_obs[cam_key] = data
-                else:
-                    logger.debug(
-                        f"Camera {cam_key} data is empty (camera not ready yet?), using all-black placeholder."
-                    )
-                    cam_obs[cam_key] = np.zeros(
-                        self._cameras_ft[cam_key], dtype=np.uint8
-                    )
+                    return cam_key, data
             except Exception as e:
                 logger.error(f"Failed to read camera {cam_key}: {e}")
+            logger.debug(f"Camera {cam_key} data is empty (camera not ready yet?), using all-black placeholder.")
+            return cam_key, np.zeros(self._cameras_ft[cam_key], dtype=np.uint8)
+
+        cam_obs: dict[str, NDArray[Any]] = {}
+        with ThreadPoolExecutor(max_workers=len(self.cameras)) as pool:
+            futures = {pool.submit(_read_camera, k): k for k in self.cameras}
+            for future in as_completed(futures):
+                key, frame = future.result()
+                cam_obs[key] = frame
 
         obs = {**cam_obs, **controller_state_obs}
         return obs
@@ -528,41 +600,55 @@ class AICRobotAICController(Robot):
         else:
             raise ValueError("Invalid teleop_target_mode")
 
-    def enable_auto_reset(self, teleop=None) -> None:
-        """Enable automatic env reset 2 s after each insertion event.
-
-        Args:
-            teleop: optional teleoperator (e.g. AICCheatCodeTeleop). If provided,
-                    update_task() is called on it with the new task_info after reset.
-        """
-        self._auto_reset_teleop = teleop
+    def enable_auto_reset(self) -> None:
+        """Enable automatic env reset on insertion event or episode timeout."""
         self._auto_reset_enabled = True
-        logger.info("Auto-reset enabled — will reset 2 s after each insertion event.")
+        self._last_reset_time = time.monotonic()
+        self._watchdog_stop.clear()
+        self._watchdog_thread = Thread(target=self._watchdog_loop, daemon=True)
+        self._watchdog_thread.start()
+        logger.info(
+            f"Auto-reset enabled — insertion event + {self.config.episode_timeout_s}s timeout."
+        )
 
     def disable_auto_reset(self) -> None:
-        """Disable automatic env reset."""
+        """Disable automatic env reset and stop the watchdog thread."""
         self._auto_reset_enabled = False
+        self._watchdog_stop.set()
+        if self._watchdog_thread is not None:
+            self._watchdog_thread.join(timeout=5.0)
+            self._watchdog_thread = None
         logger.info("Auto-reset disabled.")
+
+    def _watchdog_loop(self) -> None:
+        """Background thread: force reset if episode_timeout_s elapses with no insertion."""
+        timeout = self.config.episode_timeout_s
+        while not self._watchdog_stop.wait(timeout=1.0):
+            if not self._auto_reset_enabled or self._auto_reset_pending:
+                continue
+            elapsed = time.monotonic() - self._last_reset_time
+            if elapsed >= timeout:
+                logger.warning(
+                    f"Episode timeout ({elapsed:.1f}s >= {timeout}s) — triggering forced reset."
+                )
+                self._auto_reset_pending = True
+                Thread(target=self._auto_reset_after_delay, args=(0.0,), daemon=True).start()
 
     def _auto_reset_after_delay(self, delay: float = 2.0) -> None:
         """Background thread: wait `delay` seconds then call reset()."""
+        logger.info("auto reset thread start")
         time.sleep(delay)
         try:
-            self.reset(teleop=self._auto_reset_teleop)
+            self.reset()
         finally:
             self._auto_reset_pending = False
 
-    def reset(self, teleop=None) -> dict:
+    def reset(self) -> dict:
         """Trigger a random environment reset via the /env/reset service.
 
         Calls env_resetter.py with data=True (random reset). Parses the JSON
-        task_info from the response and — if teleop exposes an update_task()
-        method (i.e. AICCheatCodeTeleop) — forwards the new targets to it so
-        the cheatcode uses the correct port/module for the upcoming episode.
-
-        Args:
-            teleop: optional teleoperator instance. If it has update_task(),
-                    it will be called with the new task_info.
+        task_info from the response and publishes it on /env/task_info so
+        any subscriber (e.g. AICCheatCodeTeleop) can update its targets.
 
         Returns:
             task_info dict (may be empty if reset failed or resetter is unavailable).
@@ -578,35 +664,52 @@ class AICRobotAICController(Robot):
         req = SetBool.Request()
         req.data = True  # random reset
 
-        future = client.call_async(req)
-        t0 = time.monotonic()
-        while not future.done():
-            time.sleep(0.05)
-            if time.monotonic() - t0 > 120.0:
-                logger.error("/env/reset timed out after 120 s")
+        reset_in_progress.set()
+        logger.info("Reset in progress — teleop actions paused.")
+        try:
+            future = client.call_async(req)
+            t0 = time.monotonic()
+            while not future.done():
+                time.sleep(0.05)
+                if time.monotonic() - t0 > 120.0:
+                    logger.error("/env/reset timed out after 120 s")
+                    return {}
+
+            result = future.result()
+            if result is None or not result.success:
+                logger.error(f"Environment reset failed: {getattr(result, 'message', 'no response')}")
                 return {}
 
-        result = future.result()
-        if result is None or not result.success:
-            logger.error(f"Environment reset failed: {getattr(result, 'message', 'no response')}")
-            return {}
+            try:
+                task_info = json.loads(result.message)
+            except (json.JSONDecodeError, TypeError):
+                task_info = {}
+        finally:
+            reset_in_progress.clear()
+            logger.info("Reset complete — teleop actions resumed.")
 
-        try:
-            task_info = json.loads(result.message)
-        except (json.JSONDecodeError, TypeError):
-            task_info = {}
+        self.current_task_info = task_info
+        self.last_insertion_event = 0.0
+        self.episode_number += 1
+        logger.info(f"Environment reset complete. episode_number={self.episode_number} task_info={task_info}")
 
-        logger.info(f"Environment reset complete. task_info={task_info}")
+        # Stamp reset time so the watchdog timeout starts from now.
+        self._last_reset_time = time.monotonic()
 
-        # Duck-typed update: works for AICCheatCodeTeleop without a circular import.
-        if task_info and teleop is not None and hasattr(teleop, "update_task"):
-            teleop.update_task(task_info)
+        # Publish task_info so any subscriber (e.g. AICCheatCodeTeleop) can update
+        # its targets without needing a direct reference to this robot object.
+        if task_info and self.ros2_interface:
+            msg = String()
+            msg.data = json.dumps(task_info)
+            self.ros2_interface.task_info_pub.publish(msg)
 
         return task_info
 
     def disconnect(self) -> None:
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
+
+        self.disable_auto_reset()
 
         for cam in self.cameras.values():
             cam.disconnect()
