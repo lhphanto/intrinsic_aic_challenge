@@ -390,7 +390,7 @@ class AICCheatCodeTeleop(Teleoperator):
         self.z_offset = 0.2
         self.start_time = 0.0  # Must be 0.0 here, _node doesn't exist yet!
         
-        # Integrator for the PI controller
+        # Integrator for the PI velocity controller
         self._lin_err_integrator = np.zeros(3)
         
         self._current_actions: MotionUpdateActionDict = {
@@ -573,29 +573,53 @@ class AICCheatCodeTeleop(Teleoperator):
         # 1. Look up current transforms
         port_frame = f"task_board/{self.config.task_module_name}/{self.config.task_port_name}_link"
         cable_tip_frame = f"{self.config.task_cable_name}/{self.config.task_plug_name}_link"
+        gripper_frame = "gripper/tcp"
 
         port_tf = self._get_transform("base_link", port_frame)
         plug_tf = self._get_transform("base_link", cable_tip_frame)
-        gripper_tf = self._get_transform("base_link", "gripper/tcp")
+        gripper_tf = self._get_transform("base_link", gripper_frame)
 
         # If we are missing TFs, output 0 velocity (Runaway robot fix)
         if not port_tf or not plug_tf or not gripper_tf:
             if self.phase == "INIT":
-                print("Waiting for ground truth TFs...", end="\r")
+                missing = [
+                    name for name, tf in [
+                        (port_frame, port_tf),
+                        (cable_tip_frame, plug_tf),
+                        (gripper_frame, gripper_tf),
+                    ] if tf is None
+                ]
+                print(f"Waiting for TFs: {missing}", end="\r")
             else:
+                missing = [
+                    name for name, tf in [
+                        (port_frame, port_tf),
+                        (cable_tip_frame, plug_tf),
+                        (gripper_frame, gripper_tf),
+                    ] if tf is None
+                ]
+                logger.warning(f"TF lookup failed during {self.phase}: {missing}")
                 for key in self._current_actions:
                     self._current_actions[key] = 0.0
             return cast(dict, self._current_actions)
 
         # Transition out of INIT once TFs are found
         if self.phase == "INIT":
-            logger.info("\nTFs found! Starting APPROACH phase.")
+            logger.info(
+                f"TFs found! Starting APPROACH phase.\n"
+                f"  port_frame    : {port_frame}\n"
+                f"  cable_tip_frame: {cable_tip_frame}\n"
+                f"  task_module   : {self.config.task_module_name}\n"
+                f"  task_port     : {self.config.task_port_name}\n"
+                f"  cable_name    : {self.config.task_cable_name}\n"
+                f"  plug_name     : {self.config.task_plug_name}"
+            )
             self.phase = "APPROACH"
             self.start_time = self._node.get_clock().now().nanoseconds / 1e9
 
         # 2. Compute target pose (position + orientation)
         target_pos, q_gripper_target = self.calc_gripper_pose(
-            port_tf, plug_tf, gripper_tf, z_offset=self.z_offset
+            port_tf, plug_tf, gripper_tf, z_offset=self.z_offset,
         )
 
         gripper_pos = np.array([
@@ -623,13 +647,19 @@ class AICCheatCodeTeleop(Teleoperator):
         elif self.phase == "INSERT":
             insert_elapsed = current_time - self.start_time
             # Slowly lower the target z_offset.
-            self.z_offset = max(-0.015, 0.2 - (0.07 * insert_elapsed))
+            self.z_offset = max(-0.01, 0.2 - (0.07 * insert_elapsed))
 
             # Check if the target has finished descending AND the physical
             # gripper has reached the target (or is physically blocked by the port)
-            z_error = abs(target_pos[2] - gripper_pos[2])
+            z_error = (target_pos[2] - gripper_pos[2])
 
-            if self.z_offset <= -0.015 and z_error < 0.005:
+            #logger.info(
+            #    f"INSERT z_offset={self.z_offset:.4f}  "
+            #    f"target_z={target_pos[2]:.4f}  gripper_z={gripper_pos[2]:.4f}  "
+            #    f"z_error={z_error:.4f}"
+            #)
+
+            if self.z_offset <= -0.01 and abs(z_error) < 0.005:
                 logger.info("Insertion complete. DONE phase.")
                 self.phase = "DONE"
 

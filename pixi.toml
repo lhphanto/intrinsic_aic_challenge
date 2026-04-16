@@ -18,6 +18,7 @@ distro = "kilted"
 evdev = ">=1.9.2,<2"
 
 [dependencies]
+py-opencv = { version = "*", build = "*headless*" }  # force headless build to avoid Qt6 dependency
 isort = "==5.13.2"                                                                     # version bundled by the vscode extension
 json5 = ">=0.13.0,<0.14"                                                               # version bundled by the vscode extension
 numpy = "<2.3.0"
