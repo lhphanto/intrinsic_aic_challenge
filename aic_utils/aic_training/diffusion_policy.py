@@ -4,9 +4,9 @@ Diffusion policy for the AIC cable-insertion task.
 Architecture overview:
   observation (images + robot state + task info)  [obs_horizon steps]
       │
-      ├─ ImageEncoder    → obs_horizon × num_cameras image tokens  (512-d each, ResNet18)
-      ├─ StateEncoder    → obs_horizon              state tokens   (256-d each, MLP)
-      └─ TaskEncoder     → 1                        task token     (32-d, one of 12 combos)
+      ├─ ImageEncoder    → obs_horizon × num_cameras × 4 image tokens  (128-d each)
+      ├─ StateEncoder    → obs_horizon              state tokens        (128-d each)
+      └─ TaskEncoder     → 1                        task token          (128-d, one of 12 combos)
       │
       └─► condition token sequence  (keys & values for cross-attention)
                 │
@@ -17,6 +17,15 @@ Architecture overview:
                                                                ▼
                                                          predicted noise
                                                     (used by DDPM/DDIM sampler)
+
+All tokens share a unified dimension TOKEN_DIM = 128.  No projection layers are
+needed inside DiffusionTransformer — each encoder outputs directly at that dim.
+
+  ImageEncoder:   ResNet18 feature (512-d) split into 4 × 128-d tokens per view
+  StateEncoder:   MLP  20 → 256 → 128
+  TaskEncoder:    nn.Embedding(12, 128)
+  TimestepEncoder: sinusoidal → MLP, output 128-d
+  action_in_proj:  Linear(action_dim, 128) in DiffusionPolicy
 
 Task integer encodings (from aic_robot_aic_controller.py):
 
@@ -33,7 +42,7 @@ Task integer encodings (from aic_robot_aic_controller.py):
 import torch
 import torch.nn as nn
 import torchvision
-from typing import Callable, Optional
+from typing import Callable
 
 
 # ---------------------------------------------------------------------------
@@ -43,18 +52,22 @@ from typing import Callable, Optional
 NUM_TARGET_MODULES = 10   # nic_card_mount_{0..4} + sc_port_{0..4}
 NUM_PORT_NAMES = 3        # sfp_port_0, sfp_port_1, sc_port_base
 
-# Robot state vector layout:
-#   tcp_pose.position    (3)  — x, y, z  [meters]
+# Robot state vector layout (tcp_velocity removed):
+#   tcp_pose.position    (3)  — x, y, z  [meters, raw/unnormalised]
 #   tcp_pose.orientation (4)  — qx, qy, qz, qw  [unit quaternion]
-#   tcp_velocity.linear  (3)  — vx, vy, vz  [m/s]
-#   tcp_velocity.angular (3)  — wx, wy, wz  [rad/s]
 #   joint_positions      (7)  — 6 arm joints + 1 gripper  [rad]
 #   wrench.force         (3)  — fx, fy, fz  [N]  (tare-corrected)
 #   wrench.torque        (3)  — tx, ty, tz  [Nm] (tare-corrected)
-ROBOT_STATE_DIM = 26  # 3+4+3+3+7+3+3
+ROBOT_STATE_DIM = 20  # 3+4+7+3+3
 
-# ResNet18 output dimension (after removing the fc layer)
+# Unified token dimension — every encoder outputs vectors of this size.
+# No projection layers are needed in DiffusionTransformer.
+TOKEN_DIM = 128
+
+# ResNet18 global-average-pool output dimension (after removing the fc layer).
 RESNET_FEATURE_DIM = 512
+# Each 512-d ResNet feature is split into this many TOKEN_DIM tokens.
+IMG_TOKENS_PER_VIEW = RESNET_FEATURE_DIM // TOKEN_DIM   # 4
 
 
 # ---------------------------------------------------------------------------
@@ -66,7 +79,7 @@ def get_resnet(name: str, weights=None, **kwargs) -> nn.Module:
 
     Args:
         name:    "resnet18", "resnet34", or "resnet50"
-        weights: "IMAGENET1K_V1" for pretrained ImageNet weights (default), None for random init
+        weights: "IMAGENET1K_V1" for pretrained ImageNet weights, None for random init
     Returns:
         ResNet with fc replaced by nn.Identity().
         Output dim: 512 for resnet18/34, 2048 for resnet50.
@@ -105,7 +118,6 @@ def replace_submodules(
         else:
             setattr(parent_module, k, tgt_module)
 
-    # verify all targeted modules have been replaced
     remaining = [
         k for k, m in root_module.named_modules(remove_duplicate=True)
         if predicate(m)
@@ -141,15 +153,16 @@ def replace_bn_with_gn(
 class ImageEncoder(nn.Module):
     """Encodes images from all three cameras using a single shared ResNet18.
 
-    The same ResNet18 backbone is applied independently to each camera view,
-    then the per-camera features are concatenated.
+    Each 512-d ResNet feature is split into IMG_TOKENS_PER_VIEW (=4) tokens of
+    TOKEN_DIM (=128) each, so no projection layer is needed downstream.
 
     Input:  images dict {camera_key: (B, obs_horizon, C, H, W)}
-    Output: (B, obs_horizon, num_cameras * RESNET_FEATURE_DIM)
+            pixel values expected in [0, 1].
+    Output: (B, obs_horizon * num_cameras * IMG_TOKENS_PER_VIEW, TOKEN_DIM)
+              = (B, obs_horizon * 12, 128)  when obs_horizon=1
 
-    The obs_horizon dimension allows the policy to condition on a short
-    history of frames (same pattern as the reference diffusion policy demo).
-    When obs_horizon=1 the output is (B, 1, num_cameras * 512).
+    Value range of output tokens: unbounded floats (GroupNorm + ReLU internals,
+    but the final avgpool output has no explicit bound).
     """
 
     CAMERA_KEYS = ("left_camera", "center_camera", "right_camera")
@@ -167,32 +180,32 @@ class ImageEncoder(nn.Module):
         # Replace BatchNorm with GroupNorm so the encoder is compatible with EMA
         self.backbone = replace_bn_with_gn(backbone, features_per_group=features_per_group)
 
-        self.feature_dim = RESNET_FEATURE_DIM          # 512 for resnet18
         self.num_cameras = len(self.CAMERA_KEYS)
-        self.output_dim  = self.num_cameras * self.feature_dim  # 3 * 512 = 1536
 
     def forward(self, images: dict) -> torch.Tensor:
         """
         Args:
-            images: {camera_key: (B, obs_horizon, C, H, W)}
-                    pixel values normalised to [0, 1]
+            images: {camera_key: (B, obs_horizon, C, H, W)}, pixels in [0, 1]
 
         Returns:
-            features: (B, obs_horizon, num_cameras * RESNET_FEATURE_DIM)
+            tokens: (B, obs_horizon * num_cameras * IMG_TOKENS_PER_VIEW, TOKEN_DIM)
         """
         B, T = next(iter(images.values())).shape[:2]
 
         per_camera = []
         for key in self.CAMERA_KEYS:
-            img = images[key]                          # (B, T, C, H, W)
-            # Merge batch and time so the backbone sees (B*T, C, H, W)
-            img_flat = img.flatten(end_dim=1)          # (B*T, C, H, W)
-            feat = self.backbone(img_flat)             # (B*T, 512)
-            feat = feat.reshape(B, T, self.feature_dim)  # (B, T, 512)
+            img = images[key]                              # (B, T, C, H, W)
+            img_flat = img.flatten(end_dim=1)              # (B*T, C, H, W)
+            feat = self.backbone(img_flat)                 # (B*T, 512)
+            feat = feat.reshape(B, T, RESNET_FEATURE_DIM) # (B, T, 512)
             per_camera.append(feat)
 
-        # Concatenate along feature axis: (B, T, num_cameras * 512)
-        return torch.cat(per_camera, dim=-1)
+        # (B, T, num_cameras, 512)
+        stacked = torch.stack(per_camera, dim=2)
+        # Split each 512-d feature into 4 × 128-d tokens
+        # → (B, T * num_cameras * IMG_TOKENS_PER_VIEW, TOKEN_DIM)
+        tokens = stacked.reshape(B, T * self.num_cameras * IMG_TOKENS_PER_VIEW, TOKEN_DIM)
+        return tokens
 
 
 # ---------------------------------------------------------------------------
@@ -202,21 +215,20 @@ class ImageEncoder(nn.Module):
 class DiffusionTimestepEncoder(nn.Module):
     """Encodes the diffusion timestep t into a sinusoidal + MLP embedding.
 
-    Standard in DDPM / Diffusion Policy literature.
-    Produces a vector that is added to (or concatenated with) the noisy
-    action before passing through the noise prediction network.
+    Output dim is TOKEN_DIM (=128) so it can be added directly to action tokens
+    without a projection layer.
 
     Input:  (B,) integer timestep tensor
-    Output: (B, timestep_embed_dim) float32 tensor
+    Output: (B, TOKEN_DIM)
+
+    Value range: unbounded (SiLU MLP with no output activation).
     """
 
-    def __init__(self, timestep_embed_dim: int = 128):
+    def __init__(self, timestep_embed_dim: int = TOKEN_DIM):
         super().__init__()
         self.timestep_embed_dim = timestep_embed_dim
         assert timestep_embed_dim % 2 == 0, "timestep_embed_dim must be even"
 
-        # TODO: optionally replace the MLP with a larger network or
-        #       use learned frequency embeddings instead of sinusoidal ones
         self.mlp = nn.Sequential(
             nn.Linear(timestep_embed_dim, timestep_embed_dim * 4),
             nn.SiLU(),
@@ -224,13 +236,6 @@ class DiffusionTimestepEncoder(nn.Module):
         )
 
     def _sinusoidal_embedding(self, t: torch.Tensor) -> torch.Tensor:
-        """Sinusoidal positional embedding for scalar timesteps.
-
-        Args:
-            t: (B,) integer or float timestep
-        Returns:
-            emb: (B, timestep_embed_dim)
-        """
         half = self.timestep_embed_dim // 2
         freqs = torch.exp(
             -torch.arange(half, dtype=torch.float32, device=t.device)
@@ -244,10 +249,10 @@ class DiffusionTimestepEncoder(nn.Module):
         Args:
             t: (B,) diffusion timestep indices (integers 0 … T-1)
         Returns:
-            emb: (B, timestep_embed_dim)
+            emb: (B, TOKEN_DIM)
         """
-        sin_emb = self._sinusoidal_embedding(t)   # (B, timestep_embed_dim)
-        return self.mlp(sin_emb)                  # (B, timestep_embed_dim)
+        sin_emb = self._sinusoidal_embedding(t)   # (B, TOKEN_DIM)
+        return self.mlp(sin_emb)                  # (B, TOKEN_DIM)
 
 
 # ---------------------------------------------------------------------------
@@ -255,7 +260,7 @@ class DiffusionTimestepEncoder(nn.Module):
 # ---------------------------------------------------------------------------
 
 class TaskEncoder(nn.Module):
-    """Encodes task identity as a single token from 12 valid (module, port) combinations.
+    """Encodes task identity as a single 128-d token from 12 valid (module, port) combos.
 
     Valid combinations (from aic_robot_aic_controller.py encodings):
 
@@ -275,27 +280,25 @@ class TaskEncoder(nn.Module):
          11       sc_port_1        (6)  sc_port_base (2)
 
     Input:  target_module (B,) int, port_name (B,) int
-    Output: (B, 1, task_embed_dim) — single task token
+    Output: (B, 1, TOKEN_DIM)
+
+    Value range: unbounded (standard embedding lookup, no activation).
+    Typical magnitude after random init: ~N(0, 1).
     """
 
     NUM_TASKS = 12
 
-    # Lookup table: _TASK_INDEX[target_module_int, port_name_int] → task_idx
-    # Shape (NUM_TARGET_MODULES, NUM_PORT_NAMES), -1 for invalid combinations.
     _LOOKUP = torch.full((NUM_TARGET_MODULES, NUM_PORT_NAMES), fill_value=-1, dtype=torch.long)
-    # nic_card_mount_{0..4} × {sfp_port_0, sfp_port_1}
     for _m in range(5):
-        _LOOKUP[_m, 0] = _m * 2      # sfp_port_0
-        _LOOKUP[_m, 1] = _m * 2 + 1  # sfp_port_1
-    # sc_port_0 and sc_port_1 × sc_port_base
+        _LOOKUP[_m, 0] = _m * 2
+        _LOOKUP[_m, 1] = _m * 2 + 1
     _LOOKUP[5, 2] = 10
     _LOOKUP[6, 2] = 11
 
-    def __init__(self, task_embed_dim: int = 32):
+    def __init__(self, task_embed_dim: int = TOKEN_DIM):
         super().__init__()
         self.task_embed_dim = task_embed_dim
         self.embedding = nn.Embedding(self.NUM_TASKS, task_embed_dim)
-        # Register as buffer so it moves with .to(device)
         self.register_buffer("lookup", self._LOOKUP.clone())
 
     def forward(
@@ -308,10 +311,10 @@ class TaskEncoder(nn.Module):
             target_module: (B,) int64 — index from TASK_TARGET_MODULE_ENCODING
             port_name:     (B,) int64 — index from TASK_PORT_NAME_ENCODING
         Returns:
-            task_token: (B, 1, task_embed_dim)
+            task_token: (B, 1, TOKEN_DIM)
         """
         task_idx = self.lookup[target_module, port_name]   # (B,)
-        return self.embedding(task_idx).unsqueeze(1)        # (B, 1, task_embed_dim)
+        return self.embedding(task_idx).unsqueeze(1)        # (B, 1, TOKEN_DIM)
 
 
 # ---------------------------------------------------------------------------
@@ -322,7 +325,7 @@ class DiTLayer(nn.Module):
     """Single Diffusion Transformer layer.
 
     Each action token:
-      1. Self-attends to other action tokens (captures inter-step dependencies).
+      1. Self-attends to other action tokens.
       2. Cross-attends to the condition token sequence
          (image tokens + state tokens + task token).
       3. Passes through a feed-forward network.
@@ -332,8 +335,8 @@ class DiTLayer(nn.Module):
 
     def __init__(self, d_model: int, n_heads: int, ffn_dim: int, dropout: float = 0.0):
         super().__init__()
-        self.self_attn   = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
-        self.cross_attn  = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
+        self.self_attn  = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
+        self.cross_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
         self.ffn = nn.Sequential(
             nn.Linear(d_model, ffn_dim),
             nn.GELU(),
@@ -345,31 +348,24 @@ class DiTLayer(nn.Module):
         self.norm3 = nn.LayerNorm(d_model)
         self.drop  = nn.Dropout(dropout)
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        cond: torch.Tensor,
-    ) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x:    (B, pred_horizon, d_model)  — noisy action tokens
+            x:    (B, pred_horizon, d_model)    — noisy action tokens
             cond: (B, num_cond_tokens, d_model) — condition token sequence
         Returns:
             x:    (B, pred_horizon, d_model)
         """
-        # 1. Self-attention over action tokens
         residual = x
         x = self.norm1(x)
         x, _ = self.self_attn(x, x, x)
         x = residual + self.drop(x)
 
-        # 2. Cross-attention: action tokens query the condition sequence
         residual = x
         x = self.norm2(x)
         x, _ = self.cross_attn(query=x, key=cond, value=cond)
         x = residual + self.drop(x)
 
-        # 3. Feed-forward
         residual = x
         x = self.norm3(x)
         x = self.ffn(x)
@@ -381,57 +377,41 @@ class DiTLayer(nn.Module):
 class DiffusionTransformer(nn.Module):
     """Transformer-based noise prediction network for diffusion policy.
 
+    All inputs are expected to be pre-projected to d_model (= TOKEN_DIM = 128).
+    No internal projection layers — callers are responsible for dimensionality.
+
     Condition token sequence (keys/values for cross-attention):
-      ┌─────────────────────────────────────────────────────────────────┐
-      │  image tokens   (obs_horizon × num_cameras tokens, d_model each) │
-      │  state tokens   (obs_horizon tokens, d_model each)               │
-      │  task token     (1 token for the combined task identity, d_model)  │
-      └─────────────────────────────────────────────────────────────────┘
-    Total condition tokens: obs_horizon × (num_cameras + 1) + 1
+      ┌──────────────────────────────────────────────────────────────────────┐
+      │  image tokens  (obs_horizon × num_cameras × IMG_TOKENS_PER_VIEW, 128) │
+      │  state tokens  (obs_horizon tokens, 128)                              │
+      │  task token    (1 token for the combined task identity, 128)           │
+      └──────────────────────────────────────────────────────────────────────┘
 
     Query tokens (action sequence):
-      noisy_action projected to d_model + diffusion timestep embedding added.
+      pre-projected noisy action tokens + diffusion timestep embedding added.
     """
 
     def __init__(
         self,
         action_dim: int,
-        d_model: int,
-        n_heads: int,
-        n_layers: int,
-        ffn_dim: int,
-        # input projection dims — must match encoder output dims
-        img_token_dim: int = RESNET_FEATURE_DIM,   # 512 per camera per timestep
-        state_token_dim: int = 256,                 # hidden_dim // 2
-        task_token_dim: int = 32,
-        timestep_embed_dim: int = 128,
+        d_model: int = TOKEN_DIM,
+        n_heads: int = 8,
+        n_layers: int = 4,
+        ffn_dim: int = 1024,
         dropout: float = 0.0,
     ):
         super().__init__()
 
-        # --- Input projections: each condition source → d_model ---
-        self.img_proj   = nn.Linear(img_token_dim,   d_model)
-        self.state_proj = nn.Linear(state_token_dim, d_model)
-        self.task_proj  = nn.Linear(task_token_dim,  d_model)  # applied to each of the 2 task tokens
-
-        # --- Action input projection ---
-        # noisy action tokens + timestep embedding are summed after projection
-        self.action_proj    = nn.Linear(action_dim,        d_model)
-        self.timestep_proj  = nn.Linear(timestep_embed_dim, d_model)
-
-        # --- Transformer layers ---
         self.layers = nn.ModuleList([
             DiTLayer(d_model=d_model, n_heads=n_heads, ffn_dim=ffn_dim, dropout=dropout)
             for _ in range(n_layers)
         ])
         self.norm_out = nn.LayerNorm(d_model)
-
-        # --- Output projection: d_model → action_dim ---
         self.out_proj = nn.Linear(d_model, action_dim)
 
     def forward(
         self,
-        noisy_action: torch.Tensor,
+        action_tokens: torch.Tensor,
         timestep_emb: torch.Tensor,
         img_tokens: torch.Tensor,
         state_tokens: torch.Tensor,
@@ -439,34 +419,26 @@ class DiffusionTransformer(nn.Module):
     ) -> torch.Tensor:
         """
         Args:
-            noisy_action:  (B, pred_horizon, action_dim)
-            timestep_emb:  (B, timestep_embed_dim)
-            img_tokens:    (B, obs_horizon * num_cameras, RESNET_FEATURE_DIM)
-            state_tokens:  (B, obs_horizon, state_token_dim)
-            task_token:    (B, 1, task_token_dim)
+            action_tokens: (B, pred_horizon, d_model)  — noisy actions, pre-projected
+            timestep_emb:  (B, d_model)                — diffusion timestep embedding
+            img_tokens:    (B, obs_horizon * num_cameras * IMG_TOKENS_PER_VIEW, d_model)
+            state_tokens:  (B, obs_horizon, d_model)
+            task_token:    (B, 1, d_model)
 
         Returns:
             noise_pred: (B, pred_horizon, action_dim)
         """
-        # --- Build condition token sequence ---
-        img_cond   = self.img_proj(img_tokens)     # (B, obs_horizon*num_cameras, d_model)
-        state_cond = self.state_proj(state_tokens)  # (B, obs_horizon, d_model)
-        task_cond  = self.task_proj(task_token)     # (B, 1, d_model)
-        # cond: (B, obs_horizon*num_cameras + obs_horizon + 1, d_model)
-        cond = torch.cat([img_cond, state_cond, task_cond], dim=1)
+        # Build condition token sequence
+        cond = torch.cat([img_tokens, state_tokens, task_token], dim=1)
 
-        # --- Build action token sequence ---
-        x = self.action_proj(noisy_action)          # (B, pred_horizon, d_model)
-        # Add timestep embedding broadcast over pred_horizon
-        t = self.timestep_proj(timestep_emb)        # (B, d_model)
-        x = x + t.unsqueeze(1)                      # (B, pred_horizon, d_model)
+        # Add timestep embedding to every action token (broadcast over pred_horizon)
+        x = action_tokens + timestep_emb.unsqueeze(1)   # (B, pred_horizon, d_model)
 
-        # --- Transformer layers ---
         for layer in self.layers:
             x = layer(x, cond)
 
-        x = self.norm_out(x)                        # (B, pred_horizon, d_model)
-        return self.out_proj(x)                     # (B, pred_horizon, action_dim)
+        x = self.norm_out(x)
+        return self.out_proj(x)                          # (B, pred_horizon, action_dim)
 
 
 # ---------------------------------------------------------------------------
@@ -480,35 +452,33 @@ class DiffusionPolicy(nn.Module):
     sequence, then uses a Diffusion Transformer to predict the noise added
     to the action at each denoising step.
 
+    All internal token dimensions are unified at TOKEN_DIM = 128.
+
     Inputs at each denoising step:
-        images          dict[str, (B, obs_horizon, C, H, W)]  — one entry per camera
-        robot_state     (B, obs_horizon, ROBOT_STATE_DIM)     — tcp_pose(7), tcp_velocity(6), joint_positions(7), wrench(6)
+        images          dict[str, (B, obs_horizon, C, H, W)]  — one entry per camera, pixels in [0,1]
+        robot_state     (B, obs_horizon, ROBOT_STATE_DIM)     — tcp_pose(7), joint_positions(7), wrench(6)
         target_module   (B,)  int                              — task target module index
         port_name       (B,)  int                              — task port name index
         noisy_action    (B, pred_horizon, action_dim)          — action corrupted with noise
                         action layout: [x, y, z, qx, qy, qz, qw]
-                        where (x,y,z) is tcp_pose.position and (qx,qy,qz,qw) is tcp_pose.orientation
         timestep        (B,)  int                              — diffusion step index
 
     Output:
         noise_pred      (B, pred_horizon, action_dim)          — predicted noise
 
-    Condition token sequence fed into cross-attention:
-        obs_horizon × num_cameras  image tokens   (one per camera per obs step)
-        obs_horizon                state tokens   (one per obs step)
-        1                          task token     (one of 12 valid task combinations)
+    Condition tokens fed into cross-attention:
+        obs_horizon × num_cameras × IMG_TOKENS_PER_VIEW  image tokens  (128-d each)
+        obs_horizon                                       state tokens  (128-d each)
+        1                                                 task token    (128-d)
     """
 
     def __init__(
         self,
         obs_horizon: int = 2,
-        action_dim: int = 7,            # 7-DOF TCP pose: 3 position (x,y,z) + 4 orientation (qx,qy,qz,qw)
-        timestep_embed_dim: int = 128,
-        task_embed_dim: int = 32,
+        action_dim: int = 7,        # tcp_pose: 3 position (x,y,z) + 4 orientation (qx,qy,qz,qw)
         robot_state_dim: int = ROBOT_STATE_DIM,
-        hidden_dim: int = 512,          # robot state encoder hidden size; state token dim = hidden_dim // 2
         # Diffusion Transformer hyperparameters
-        d_model: int = 256,
+        d_model: int = TOKEN_DIM,
         n_heads: int = 8,
         n_layers: int = 4,
         ffn_dim: int = 1024,
@@ -526,29 +496,30 @@ class DiffusionPolicy(nn.Module):
             resnet_name=resnet_name,
             weights=resnet_weights,
         )
-        # Produces (B, obs_horizon, num_cameras * RESNET_FEATURE_DIM)
-        # We split this back to per-camera tokens inside forward()
+        # Output: (B, obs_horizon * num_cameras * IMG_TOKENS_PER_VIEW, TOKEN_DIM)
 
         # --- Diffusion timestep encoder ---
-        self.timestep_encoder = DiffusionTimestepEncoder(
-            timestep_embed_dim=timestep_embed_dim
-        )
+        self.timestep_encoder = DiffusionTimestepEncoder(timestep_embed_dim=d_model)
 
         # --- Task encoder → single task token ---
-        self.task_encoder = TaskEncoder(task_embed_dim=task_embed_dim)
+        self.task_encoder = TaskEncoder(task_embed_dim=d_model)
 
         # --- Robot state encoder → one state token per obs step ---
-        # Input layout (ROBOT_STATE_DIM=26):
+        # Input (ROBOT_STATE_DIM=20):
         #   tcp_pose.position (3), tcp_pose.orientation (4),
-        #   tcp_velocity.linear (3), tcp_velocity.angular (3),
         #   joint_positions (7), wrench.force (3), wrench.torque (3)
+        # Value ranges: position [m], orientation [unit quaternion], joints [rad],
+        #   wrench [N / Nm] — all raw/unnormalised.
         # TODO: add input normalisation (mean/std from dataset stats)
-        state_token_dim = hidden_dim // 2
         self.state_encoder = nn.Sequential(
-            nn.Linear(robot_state_dim, hidden_dim),
+            nn.Linear(robot_state_dim, 256),
             nn.ReLU(),
-            nn.Linear(hidden_dim, state_token_dim),
+            nn.Linear(256, d_model),    # output is TOKEN_DIM = 128
         )
+
+        # --- Action input projection: action_dim → TOKEN_DIM ---
+        # Kept outside DiffusionTransformer so the transformer has no projection layers.
+        self.action_in_proj = nn.Linear(action_dim, d_model)
 
         # --- Diffusion Transformer (noise prediction network) ---
         self.noise_pred_net = DiffusionTransformer(
@@ -557,10 +528,6 @@ class DiffusionPolicy(nn.Module):
             n_heads=n_heads,
             n_layers=n_layers,
             ffn_dim=ffn_dim,
-            img_token_dim=RESNET_FEATURE_DIM,   # 512 — one token per camera per obs step
-            state_token_dim=state_token_dim,
-            task_token_dim=task_embed_dim,
-            timestep_embed_dim=timestep_embed_dim,
             dropout=dropout,
         )
 
@@ -587,33 +554,29 @@ class DiffusionPolicy(nn.Module):
             noise_pred: (B, pred_horizon, action_dim)
         """
         B = noisy_action.shape[0]
-        num_cameras = len(ImageEncoder.CAMERA_KEYS)
 
-        # --- Image tokens ---
-        # image_encoder returns (B, obs_horizon, num_cameras * 512)
-        img_feat = self.image_encoder(images)
-        # Reshape to (B, obs_horizon * num_cameras, 512) — one token per camera per step
-        img_tokens = img_feat.reshape(B, self.obs_horizon * num_cameras, RESNET_FEATURE_DIM)
+        # --- Image tokens: (B, obs_horizon * num_cameras * 4, 128) ---
+        img_tokens = self.image_encoder(images)
 
         # --- State tokens: one per obs step ---
-        # robot_state: (B, obs_horizon, ROBOT_STATE_DIM)
         state_tokens = self.state_encoder(
-            robot_state.flatten(end_dim=1)                   # (B*obs_horizon, ROBOT_STATE_DIM)
-        ).reshape(B, self.obs_horizon, -1)                   # (B, obs_horizon, state_token_dim)
+            robot_state.flatten(end_dim=1)                    # (B*obs_horizon, ROBOT_STATE_DIM)
+        ).reshape(B, self.obs_horizon, -1)                    # (B, obs_horizon, TOKEN_DIM)
 
         # --- Task token: single embedding for the combined task identity ---
-        task_token = self.task_encoder(
-            target_module, port_name
-        )                                                    # (B, 1, task_embed_dim)
+        task_token = self.task_encoder(target_module, port_name)  # (B, 1, TOKEN_DIM)
 
         # --- Diffusion timestep embedding ---
-        timestep_emb = self.timestep_encoder(timestep)       # (B, timestep_embed_dim)
+        timestep_emb = self.timestep_encoder(timestep)        # (B, TOKEN_DIM)
+
+        # --- Project noisy action to token dim ---
+        action_tokens = self.action_in_proj(noisy_action)     # (B, pred_horizon, TOKEN_DIM)
 
         # --- Predict noise via Diffusion Transformer ---
         return self.noise_pred_net(
-            noisy_action=noisy_action,
+            action_tokens=action_tokens,
             timestep_emb=timestep_emb,
             img_tokens=img_tokens,
             state_tokens=state_tokens,
             task_token=task_token,
-        )                                                    # (B, pred_horizon, action_dim)
+        )                                                     # (B, pred_horizon, action_dim)
