@@ -6,7 +6,7 @@ Architecture overview:
       │
       ├─ ImageEncoder    → obs_horizon × num_cameras image tokens  (512-d each, ResNet18)
       ├─ StateEncoder    → obs_horizon              state tokens   (256-d each, MLP)
-      └─ TaskEncoder     → 1                        task token     (32-d, embedding lookup)
+      └─ TaskEncoder     → 1                        task token     (32-d, one of 12 combos)
       │
       └─► condition token sequence  (keys & values for cross-attention)
                 │
@@ -43,8 +43,15 @@ from typing import Callable, Optional
 NUM_TARGET_MODULES = 10   # nic_card_mount_{0..4} + sc_port_{0..4}
 NUM_PORT_NAMES = 3        # sfp_port_0, sfp_port_1, sc_port_base
 
-# Robot state vector length (tcp_pose 7 + tcp_velocity 6 + tcp_error 6 + joint_positions 7)
-ROBOT_STATE_DIM = 26
+# Robot state vector layout:
+#   tcp_pose.position    (3)  — x, y, z  [meters]
+#   tcp_pose.orientation (4)  — qx, qy, qz, qw  [unit quaternion]
+#   tcp_velocity.linear  (3)  — vx, vy, vz  [m/s]
+#   tcp_velocity.angular (3)  — wx, wy, wz  [rad/s]
+#   joint_positions      (7)  — 6 arm joints + 1 gripper  [rad]
+#   wrench.force         (3)  — fx, fy, fz  [N]  (tare-corrected)
+#   wrench.torque        (3)  — tx, ty, tz  [Nm] (tare-corrected)
+ROBOT_STATE_DIM = 26  # 3+4+3+3+7+3+3
 
 # ResNet18 output dimension (after removing the fc layer)
 RESNET_FEATURE_DIM = 512
@@ -248,40 +255,48 @@ class DiffusionTimestepEncoder(nn.Module):
 # ---------------------------------------------------------------------------
 
 class TaskEncoder(nn.Module):
-    """Encodes task identity (target_module + port_name) into an embedding.
+    """Encodes task identity as a single token from 12 valid (module, port) combinations.
 
-    Both inputs are integers whose ranges are defined in
-    aic_robot_aic_controller.py:
-        target_module ∈ {0 … NUM_TARGET_MODULES-1}   (10 values)
-        port_name     ∈ {0 … NUM_PORT_NAMES-1}        (3 values)
+    Valid combinations (from aic_robot_aic_controller.py encodings):
 
-    The two embeddings are concatenated and passed through an MLP to
-    produce a single task embedding.
+        task_idx  target_module        port_name
+        ────────  ───────────────────  ──────────────
+          0       nic_card_mount_0 (0)  sfp_port_0 (0)
+          1       nic_card_mount_0 (0)  sfp_port_1 (1)
+          2       nic_card_mount_1 (1)  sfp_port_0 (0)
+          3       nic_card_mount_1 (1)  sfp_port_1 (1)
+          4       nic_card_mount_2 (2)  sfp_port_0 (0)
+          5       nic_card_mount_2 (2)  sfp_port_1 (1)
+          6       nic_card_mount_3 (3)  sfp_port_0 (0)
+          7       nic_card_mount_3 (3)  sfp_port_1 (1)
+          8       nic_card_mount_4 (4)  sfp_port_0 (0)
+          9       nic_card_mount_4 (4)  sfp_port_1 (1)
+         10       sc_port_0        (5)  sc_port_base (2)
+         11       sc_port_1        (6)  sc_port_base (2)
 
     Input:  target_module (B,) int, port_name (B,) int
-    Output: (B, task_embed_dim) float32 tensor
+    Output: (B, 1, task_embed_dim) — single task token
     """
 
-    def __init__(
-        self,
-        task_embed_dim: int = 32,
-        num_target_modules: int = NUM_TARGET_MODULES,
-        num_port_names: int = NUM_PORT_NAMES,
-        per_field_embed_dim: int = 16,
-    ):
+    NUM_TASKS = 12
+
+    # Lookup table: _TASK_INDEX[target_module_int, port_name_int] → task_idx
+    # Shape (NUM_TARGET_MODULES, NUM_PORT_NAMES), -1 for invalid combinations.
+    _LOOKUP = torch.full((NUM_TARGET_MODULES, NUM_PORT_NAMES), fill_value=-1, dtype=torch.long)
+    # nic_card_mount_{0..4} × {sfp_port_0, sfp_port_1}
+    for _m in range(5):
+        _LOOKUP[_m, 0] = _m * 2      # sfp_port_0
+        _LOOKUP[_m, 1] = _m * 2 + 1  # sfp_port_1
+    # sc_port_0 and sc_port_1 × sc_port_base
+    _LOOKUP[5, 2] = 10
+    _LOOKUP[6, 2] = 11
+
+    def __init__(self, task_embed_dim: int = 32):
         super().__init__()
         self.task_embed_dim = task_embed_dim
-
-        # Learned embedding tables
-        self.module_embedding = nn.Embedding(num_target_modules, per_field_embed_dim)
-        self.port_embedding   = nn.Embedding(num_port_names,     per_field_embed_dim)
-
-        # TODO: optionally increase depth or add layer norm
-        self.mlp = nn.Sequential(
-            nn.Linear(per_field_embed_dim * 2, task_embed_dim * 2),
-            nn.ReLU(),
-            nn.Linear(task_embed_dim * 2, task_embed_dim),
-        )
+        self.embedding = nn.Embedding(self.NUM_TASKS, task_embed_dim)
+        # Register as buffer so it moves with .to(device)
+        self.register_buffer("lookup", self._LOOKUP.clone())
 
     def forward(
         self,
@@ -293,12 +308,10 @@ class TaskEncoder(nn.Module):
             target_module: (B,) int64 — index from TASK_TARGET_MODULE_ENCODING
             port_name:     (B,) int64 — index from TASK_PORT_NAME_ENCODING
         Returns:
-            task_emb: (B, task_embed_dim)
+            task_token: (B, 1, task_embed_dim)
         """
-        mod_emb  = self.module_embedding(target_module)   # (B, per_field_embed_dim)
-        port_emb = self.port_embedding(port_name)         # (B, per_field_embed_dim)
-        combined = torch.cat([mod_emb, port_emb], dim=-1) # (B, per_field_embed_dim*2)
-        return self.mlp(combined)                         # (B, task_embed_dim)
+        task_idx = self.lookup[target_module, port_name]   # (B,)
+        return self.embedding(task_idx).unsqueeze(1)        # (B, 1, task_embed_dim)
 
 
 # ---------------------------------------------------------------------------
@@ -372,7 +385,7 @@ class DiffusionTransformer(nn.Module):
       ┌─────────────────────────────────────────────────────────────────┐
       │  image tokens   (obs_horizon × num_cameras tokens, d_model each) │
       │  state tokens   (obs_horizon tokens, d_model each)               │
-      │  task token     (1 token, d_model)                               │
+      │  task token     (1 token for the combined task identity, d_model)  │
       └─────────────────────────────────────────────────────────────────┘
     Total condition tokens: obs_horizon × (num_cameras + 1) + 1
 
@@ -399,7 +412,7 @@ class DiffusionTransformer(nn.Module):
         # --- Input projections: each condition source → d_model ---
         self.img_proj   = nn.Linear(img_token_dim,   d_model)
         self.state_proj = nn.Linear(state_token_dim, d_model)
-        self.task_proj  = nn.Linear(task_token_dim,  d_model)
+        self.task_proj  = nn.Linear(task_token_dim,  d_model)  # applied to each of the 2 task tokens
 
         # --- Action input projection ---
         # noisy action tokens + timestep embedding are summed after projection
@@ -469,7 +482,7 @@ class DiffusionPolicy(nn.Module):
 
     Inputs at each denoising step:
         images          dict[str, (B, obs_horizon, C, H, W)]  — one entry per camera
-        robot_state     (B, obs_horizon, ROBOT_STATE_DIM)     — tcp_pose, velocity, error, joints
+        robot_state     (B, obs_horizon, ROBOT_STATE_DIM)     — tcp_pose(7), tcp_velocity(6), joint_positions(7), wrench(6)
         target_module   (B,)  int                              — task target module index
         port_name       (B,)  int                              — task port name index
         noisy_action    (B, pred_horizon, action_dim)          — action corrupted with noise
@@ -483,7 +496,7 @@ class DiffusionPolicy(nn.Module):
     Condition token sequence fed into cross-attention:
         obs_horizon × num_cameras  image tokens   (one per camera per obs step)
         obs_horizon                state tokens   (one per obs step)
-        1                          task token     (time-invariant)
+        1                          task token     (one of 12 valid task combinations)
     """
 
     def __init__(
@@ -525,6 +538,10 @@ class DiffusionPolicy(nn.Module):
         self.task_encoder = TaskEncoder(task_embed_dim=task_embed_dim)
 
         # --- Robot state encoder → one state token per obs step ---
+        # Input layout (ROBOT_STATE_DIM=26):
+        #   tcp_pose.position (3), tcp_pose.orientation (4),
+        #   tcp_velocity.linear (3), tcp_velocity.angular (3),
+        #   joint_positions (7), wrench.force (3), wrench.torque (3)
         # TODO: add input normalisation (mean/std from dataset stats)
         state_token_dim = hidden_dim // 2
         self.state_encoder = nn.Sequential(
@@ -584,10 +601,10 @@ class DiffusionPolicy(nn.Module):
             robot_state.flatten(end_dim=1)                   # (B*obs_horizon, ROBOT_STATE_DIM)
         ).reshape(B, self.obs_horizon, -1)                   # (B, obs_horizon, state_token_dim)
 
-        # --- Task token: single time-invariant token ---
+        # --- Task token: single embedding for the combined task identity ---
         task_token = self.task_encoder(
             target_module, port_name
-        ).unsqueeze(1)                                       # (B, 1, task_embed_dim)
+        )                                                    # (B, 1, task_embed_dim)
 
         # --- Diffusion timestep embedding ---
         timestep_emb = self.timestep_encoder(timestep)       # (B, timestep_embed_dim)
