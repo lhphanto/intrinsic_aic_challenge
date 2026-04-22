@@ -402,6 +402,13 @@ class DiffusionTransformer(nn.Module):
     ):
         super().__init__()
 
+        # Per-stream LayerNorms applied before concatenating condition tokens.
+        # Each encoder has a different output scale; these bring them into the
+        # same range before the first cross-attention layer sees them.
+        self.norm_img   = nn.LayerNorm(d_model)
+        self.norm_state = nn.LayerNorm(d_model)
+        self.norm_task  = nn.LayerNorm(d_model)
+
         self.layers = nn.ModuleList([
             DiTLayer(d_model=d_model, n_heads=n_heads, ffn_dim=ffn_dim, dropout=dropout)
             for _ in range(n_layers)
@@ -428,8 +435,13 @@ class DiffusionTransformer(nn.Module):
         Returns:
             noise_pred: (B, pred_horizon, action_dim)
         """
-        # Build condition token sequence
-        cond = torch.cat([img_tokens, state_tokens, task_token], dim=1)
+        # Normalise each condition stream independently before concatenating.
+        # This compensates for the different output scales of image, state, and task encoders.
+        cond = torch.cat([
+            self.norm_img(img_tokens),
+            self.norm_state(state_tokens),
+            self.norm_task(task_token),
+        ], dim=1)
 
         # Add timestep embedding to every action token (broadcast over pred_horizon)
         x = action_tokens + timestep_emb.unsqueeze(1)   # (B, pred_horizon, d_model)
@@ -580,3 +592,77 @@ class DiffusionPolicy(nn.Module):
             state_tokens=state_tokens,
             task_token=task_token,
         )                                                     # (B, pred_horizon, action_dim)
+
+    @torch.no_grad()
+    def sample(
+        self,
+        images: dict,
+        robot_state: torch.Tensor,
+        target_module: torch.Tensor,
+        port_name: torch.Tensor,
+        num_timesteps: int = 100,
+        beta_start: float = 1e-4,
+        beta_end: float = 0.02,
+        pred_horizon: int = 16,
+    ) -> torch.Tensor:
+        """Run DDPM reverse diffusion to generate an action sequence.
+
+        Starts from pure Gaussian noise and iteratively denoises over
+        num_timesteps steps using the trained noise prediction network.
+
+        Args:
+            images:        {camera_key: (B, obs_horizon, C, H, W)} — normalised to [0, 1]
+            robot_state:   (B, obs_horizon, ROBOT_STATE_DIM)
+            target_module: (B,) int64
+            port_name:     (B,) int64
+            num_timesteps: number of denoising steps (should match training)
+            beta_start:    start of linear beta schedule (should match training)
+            beta_end:      end of linear beta schedule (should match training)
+            pred_horizon:  number of action steps to generate
+
+        Returns:
+            action: (B, pred_horizon, action_dim) — denoised tcp_pose sequence
+        """
+        device = robot_state.device
+        B = robot_state.shape[0]
+
+        # Build noise schedule on the fly (must match training schedule)
+        betas     = torch.linspace(beta_start, beta_end, num_timesteps, device=device)
+        alphas    = 1.0 - betas
+        alpha_bar = torch.cumprod(alphas, dim=0)
+
+        # x_T ~ N(0, I)
+        x = torch.randn(B, pred_horizon, self.action_dim, device=device)
+
+        # Reverse diffusion: t = T-1 → 0
+        for t_int in reversed(range(num_timesteps)):
+            t = torch.full((B,), t_int, dtype=torch.long, device=device)
+
+            # Predict noise
+            eps = self(
+                images=images,
+                robot_state=robot_state,
+                target_module=target_module,
+                port_name=port_name,
+                noisy_action=x,
+                timestep=t,
+            )
+
+            # DDPM reverse step:
+            #   x_{t-1} = 1/sqrt(alpha_t) * (x_t - beta_t/sqrt(1-alpha_bar_t) * eps)
+            #             + sigma_t * z   (z=0 at t=0)
+            alpha_t    = alphas[t_int]
+            alpha_bar_t = alpha_bar[t_int]
+            beta_t     = betas[t_int]
+
+            mean = (x - beta_t / (1.0 - alpha_bar_t).sqrt() * eps) / alpha_t.sqrt()
+
+            if t_int > 0:
+                # Posterior variance: beta_t * (1 - alpha_bar_{t-1}) / (1 - alpha_bar_t)
+                alpha_bar_prev = alpha_bar[t_int - 1]
+                variance = beta_t * (1.0 - alpha_bar_prev) / (1.0 - alpha_bar_t)
+                x = mean + variance.sqrt() * torch.randn_like(x)
+            else:
+                x = mean
+
+        return x  # (B, pred_horizon, action_dim)
