@@ -11,6 +11,7 @@ COPY aic_interfaces /ws_aic/src/aic/aic_interfaces
 COPY aic_utils /ws_aic/src/aic/aic_utils
 COPY pixi.toml pixi.lock /ws_aic/src/aic/
 COPY pixi_env_setup.sh /ws_aic/src/aic/
+COPY outputs/0512_keypoint1/best.pt /ws_aic/checkpoints/0512_keypoint1_best.pt
 
 # Add other dependencies
 
@@ -57,4 +58,4 @@ exec pixi run --as-is ros2 run aic_model aic_model "$@"
 EOF
 
 ENTRYPOINT ["/entrypoint.sh"]
-CMD ["--ros-args", "-p", "policy:=aic_example_policies.ros.CheatCode", "-p", "use_sim_time:=true"]
+CMD ["--ros-args", "-p", "policy:=aic_example_policies.ros.RunHeuristic", "-p", "use_sim_time:=true"]
