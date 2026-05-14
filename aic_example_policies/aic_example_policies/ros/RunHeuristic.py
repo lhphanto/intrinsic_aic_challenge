@@ -107,13 +107,20 @@ _CONF_PRES_MIN = 0.55
 # As soon as the port is detected, the search state resets automatically.
 _NO_DETECT_PATIENCE = 5
 _SEARCH_DWELL       = 3
+# Each entry is (dx, dy, dz) relative to the TCP position when search started.
+# dz is kept small and never negative so the arm does not descend during search.
+# XY offsets are larger to sweep a wider field of view.
 _SEARCH_PATTERN: list[tuple[float, float, float]] = [
-    ( 0.000,  0.000,  0.030),  # lift up 30 mm — reduce self-occlusion
-    ( 0.020,  0.000,  0.030),  # lift + shift right
-    (-0.020,  0.000,  0.030),  # lift + shift left
-    ( 0.000,  0.020,  0.030),  # lift + shift forward
-    ( 0.000, -0.020,  0.030),  # lift + shift backward
-    ( 0.000,  0.000,  0.060),  # lift more if still not found
+    ( 0.000,  0.000,  0.015),  # slight lift only
+    ( 0.040,  0.000,  0.015),  # shift right
+    (-0.040,  0.000,  0.015),  # shift left
+    ( 0.000,  0.040,  0.015),  # shift forward
+    ( 0.000, -0.040,  0.015),  # shift backward
+    ( 0.030,  0.030,  0.015),  # diagonal
+    (-0.030,  0.030,  0.015),  # diagonal
+    ( 0.030, -0.030,  0.015),  # diagonal
+    (-0.030, -0.030,  0.015),  # diagonal
+    ( 0.000,  0.000,  0.040),  # lift more as last resort
 ]
 
 # Preprocessing applied to each camera image before the keypoint model.

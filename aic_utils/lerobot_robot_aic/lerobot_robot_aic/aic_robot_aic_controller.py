@@ -319,26 +319,19 @@ class AICRobotAICController(Robot):
         self.episode_number: int = 0
 
         # Auto-reset on insertion event, approach done, or episode timeout
-        # Port center projections: keyed by "port_center.{cam}.{entity}.{port}.{u|v|dist}"
-        # u, v: pixel coords in full-res camera space (-1 if not visible).
-        # dist: Euclidean distance in metres from camera optical centre to port (-1 if unknown).
+        # Port target poses: keyed by "port_center.{entity}.{port}.{x|y|z|qx|qy|qz|qw}"
+        # Values are the port TF frame pose in base_link (position + quaternion).
         # Initialized to -1 (invalid); updated per-frame via _project_port_centers_nonblocking().
         self._port_centers: dict[str, float] = {
-            f"port_center.{cam}.{entity}.{port_key}.{coord}": -1.0
-            for cam in _CAMERA_NAMES
+            f"port_center.{entity}.{port}.{coord}": -1.0
             for entity, ports in _ENTITY_PORTS.items()
             for port in ports
-            for port_key in [port, f"{port}_entrance"]
-            for coord in ["u", "v", "dist"]
+            for coord in ["x", "y", "z", "qx", "qy", "qz", "qw"]
         }
         # Sentinel dict for fast copy-to-invalid in _project_port_centers_nonblocking.
         self._port_centers_sentinel: dict[str, float] = dict.fromkeys(self._port_centers, -1.0)
         # Which entities are currently on the board (set at reset / connect time).
         self._present_entities: set[str] = set()
-        # Camera projection parameters cached at reset/connect time; P, image size
-        # and frame_id don't change between resets so there's no need to re-fetch
-        # camera_infos on every frame inside _project_port_centers_nonblocking.
-        self._camera_projection_cache: dict[str, dict] = {}
         # Persistent thread pool for parallel camera reads (avoids per-frame create/destroy).
         self._camera_thread_pool: ThreadPoolExecutor | None = None
 
@@ -704,187 +697,105 @@ class AICRobotAICController(Robot):
             raise ValueError("Invalid teleop_target_mode")
 
     def _compute_port_centers(self) -> None:
-        """Project each present port's TF frame into every camera image.
+        """Look up each present port's TF pose in base_link and store as 7-DOF target.
 
         Results are stored in self._port_centers keyed by
-        "port_center.{camera}.{entity}.{port}.{u|v}". Entries for ports that
-        are absent, behind the camera (Z<=0), or outside the image bounds are
-        left at -1.0.
+        "port_center.{entity}.{port}.{x|y|z|qx|qy|qz|qw}". Entries for ports
+        that are absent or whose TF is unavailable are left at -1.0.
         """
         if not self.ros2_interface:
             return
 
         tf_buffer = self.ros2_interface.tf_buffer
-        camera_infos = self.ros2_interface.camera_infos
         present_entities = set(self.current_task_info.get("present_entities", []))
 
-        # If present_entities is not in task_info (e.g. first episode before any
-        # random reset), fall back to probing TF for every possible entity.
-        # print("LXH debug number of present entities:", len(present_entities))
-
-        # If present_entities is not in task_info (e.g. first episode before any
-        # random reset), fall back to probing TF for every possible entity.
         if not present_entities:
-            camera_frame = next(
-                (ci.header.frame_id for ci in camera_infos.values() if ci is not None),
-                None,
-            )
-            if camera_frame:
-                present_entities = {
-                    entity
-                    for entity, ports in _ENTITY_PORTS.items()
-                    if tf_buffer.can_transform(
-                        camera_frame,
-                        f"task_board/{entity}/{ports[0]}_link",
-                        Time(),
-                    )
-                }
-                if present_entities:
-                    logger.info(f"Auto-detected present entities from TF: {sorted(present_entities)}")
+            present_entities = {
+                entity
+                for entity, ports in _ENTITY_PORTS.items()
+                if tf_buffer.can_transform(
+                    "base_link",
+                    f"task_board/{entity}/{ports[0]}_link",
+                    Time(),
+                )
+            }
+            if present_entities:
+                logger.info(f"Auto-detected present entities from TF: {sorted(present_entities)}")
 
         self._present_entities = present_entities
         centers = {k: -1.0 for k in self._port_centers}
 
-        for cam_name in _CAMERA_NAMES:
-            cam_info = camera_infos.get(cam_name)
-            if cam_info is None:
+        for entity in present_entities:
+            ports = _ENTITY_PORTS.get(entity)
+            if ports is None:
                 continue
-            camera_frame = cam_info.header.frame_id
-            P = np.array(cam_info.p).reshape(3, 4)
-            img_h, img_w = cam_info.height, cam_info.width
-            p0, p1, p2 = P[0].tolist(), P[1].tolist(), P[2].tolist()
-
-            # Cache projection parameters — these are stable until the next reset.
-            # P_rows stored as Python float lists to avoid numpy overhead in the per-frame path.
-            self._camera_projection_cache[cam_name] = {
-                "camera_frame": camera_frame,
-                "P_rows": (p0, p1, p2),
-                "img_h": img_h,
-                "img_w": img_w,
-            }
-
-            for entity in present_entities:
-                ports = _ENTITY_PORTS.get(entity)
-                if ports is None:
+            for port_name in ports:
+                tf_frame = f"task_board/{entity}/{port_name}_link"
+                try:
+                    t = tf_buffer.lookup_transform(
+                        "base_link",
+                        tf_frame,
+                        Time(),
+                        timeout=Duration(seconds=0.1),
+                    )
+                except TransformException as ex:
+                    logger.debug(f"TF lookup failed for {tf_frame}: {ex}")
                     continue
-                for port_name in ports:
-                    for port_key, tf_frame in [
-                        (port_name,              f"task_board/{entity}/{port_name}_link"),
-                        (f"{port_name}_entrance", f"task_board/{entity}/{port_name}_link_entrance"),
-                    ]:
-                        try:
-                            t = tf_buffer.lookup_transform(
-                                camera_frame,
-                                tf_frame,
-                                Time(),
-                                timeout=Duration(seconds=0.1),
-                            )
-                        except TransformException as ex:
-                            logger.debug(f"TF lookup failed for {tf_frame}: {ex}")
-                            continue
 
-                        X = t.transform.translation.x
-                        Y = t.transform.translation.y
-                        Z = t.transform.translation.z
-
-                        if Z <= 0.0:
-                            continue
-
-                        centers[f"port_center.{cam_name}.{entity}.{port_key}.dist"] = math.sqrt(X*X + Y*Y + Z*Z)
-
-                        w = p2[0]*X + p2[1]*Y + p2[2]*Z + p2[3]
-                        u = (p0[0]*X + p0[1]*Y + p0[2]*Z + p0[3]) / w
-                        v = (p1[0]*X + p1[1]*Y + p1[2]*Z + p1[3]) / w
-
-                        if not (0 <= u < img_w and 0 <= v < img_h):
-                            continue
-
-                        centers[f"port_center.{cam_name}.{entity}.{port_key}.u"] = float(u)
-                        centers[f"port_center.{cam_name}.{entity}.{port_key}.v"] = float(v)
+                tr = t.transform.translation
+                ro = t.transform.rotation
+                centers[f"port_center.{entity}.{port_name}.x"]  = tr.x
+                centers[f"port_center.{entity}.{port_name}.y"]  = tr.y
+                centers[f"port_center.{entity}.{port_name}.z"]  = tr.z
+                centers[f"port_center.{entity}.{port_name}.qx"] = ro.x
+                centers[f"port_center.{entity}.{port_name}.qy"] = ro.y
+                centers[f"port_center.{entity}.{port_name}.qz"] = ro.z
+                centers[f"port_center.{entity}.{port_name}.qw"] = ro.w
 
         self._port_centers = centers
         logger.info(f"Port centers computed for {len(present_entities)} entities")
 
-        #logger.info(
-        #    f"Port centers computed for {len(present_entities)} entities: "
-        #    + ", ".join(
-        #        f"{k}=({centers[k.replace('.v', '.u')]:.1f})"
-        #        for k in centers
-        #        if k.endswith(".v") and centers[k] >= 0
-        #    )
-        #)
-
     def _project_port_centers_nonblocking(
         self, cam_timestamps: dict[str, Time] | None = None
     ) -> dict[str, float]:
-        """Project present ports into camera images using per-camera TF timestamps.
+        """Look up present ports' TF poses in base_link and return as 7-DOF targets.
 
-        `cam_timestamps` maps camera name → ROS Time snapshotted immediately
-        after that camera's async_read() returned.  Using a per-camera timestamp
-        means each camera's port projection reflects the robot pose at the moment
-        that camera's frame was captured, rather than a single shared time.
-        Falls back to Time() (latest) for any camera without a timestamp.
+        `cam_timestamps` is unused but kept for API compatibility with the call site
+        in get_observation().
         """
-        #proj_t0 = time.monotonic()
-        #logger.info(f"[_project_port_centers] START {_ts()}")
-
-        if not self.ros2_interface or not self._present_entities or not self._camera_projection_cache:
-            #logger.info(f"[_project_port_centers] END (no interface/entities/cache)  {_ts()}  ({(time.monotonic()-proj_t0)*1000:.1f} ms)")
+        if not self.ros2_interface or not self._present_entities:
             return {k: -1.0 for k in self._port_centers}
 
         tf_buffer = self.ros2_interface.tf_buffer
         centers = self._port_centers_sentinel.copy()
 
-        for cam_name in _CAMERA_NAMES:
-            cam_cache = self._camera_projection_cache.get(cam_name)
-            if cam_cache is None:
+        for entity in self._present_entities:
+            ports = _ENTITY_PORTS.get(entity)
+            if ports is None:
                 continue
-            camera_frame  = cam_cache["camera_frame"]
-            p0, p1, p2    = cam_cache["P_rows"]
-            img_h         = cam_cache["img_h"]
-            img_w         = cam_cache["img_w"]
-            tf_query_time = (cam_timestamps or {}).get(cam_name, Time())
-
-            for entity in self._present_entities:
-                ports = _ENTITY_PORTS.get(entity)
-                if ports is None:
+            for port_name in ports:
+                tf_frame = f"task_board/{entity}/{port_name}_link"
+                try:
+                    t = tf_buffer.lookup_transform(
+                        "base_link",
+                        tf_frame,
+                        Time(),
+                        timeout=Duration(seconds=0),
+                    )
+                except TransformException as e:
+                    logger.debug(f"TF lookup failed for {tf_frame}: {e}")
                     continue
-                for port_name in ports:
-                    for port_key, tf_frame in [
-                        (port_name,              f"task_board/{entity}/{port_name}_link"),
-                        (f"{port_name}_entrance", f"task_board/{entity}/{port_name}_link_entrance"),
-                    ]:
-                        try:
-                            t = tf_buffer.lookup_transform(
-                                camera_frame,
-                                tf_frame,
-                                tf_query_time,
-                                timeout=Duration(seconds=0),
-                            )
-                        except TransformException as e:
-                            logger.debug(f"TF lookup failed for {tf_frame}: {e}")
-                            continue
 
-                        X = t.transform.translation.x
-                        Y = t.transform.translation.y
-                        Z = t.transform.translation.z
+                tr = t.transform.translation
+                ro = t.transform.rotation
+                centers[f"port_center.{entity}.{port_name}.x"]  = tr.x
+                centers[f"port_center.{entity}.{port_name}.y"]  = tr.y
+                centers[f"port_center.{entity}.{port_name}.z"]  = tr.z
+                centers[f"port_center.{entity}.{port_name}.qx"] = ro.x
+                centers[f"port_center.{entity}.{port_name}.qy"] = ro.y
+                centers[f"port_center.{entity}.{port_name}.qz"] = ro.z
+                centers[f"port_center.{entity}.{port_name}.qw"] = ro.w
 
-                        if Z <= 0.0:
-                            continue
-
-                        centers[f"port_center.{cam_name}.{entity}.{port_key}.dist"] = math.sqrt(X*X + Y*Y + Z*Z)
-
-                        w = p2[0]*X + p2[1]*Y + p2[2]*Z + p2[3]
-                        u = (p0[0]*X + p0[1]*Y + p0[2]*Z + p0[3]) / w
-                        v = (p1[0]*X + p1[1]*Y + p1[2]*Z + p1[3]) / w
-
-                        if not (0 <= u < img_w and 0 <= v < img_h):
-                            continue
-
-                        centers[f"port_center.{cam_name}.{entity}.{port_key}.u"] = float(u)
-                        centers[f"port_center.{cam_name}.{entity}.{port_key}.v"] = float(v)
-
-        #logger.info(f"[_project_port_centers] END   {_ts()}  ({(time.monotonic()-proj_t0)*1000:.1f} ms)")
         return centers
 
     def enable_auto_reset(self) -> None:
